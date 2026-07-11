@@ -20,7 +20,7 @@
 | 项 | 规则 |
 |---|------|
 | `.env` | 含真实 API Key / Webhook,`.gitignore` 已覆盖,**禁止入库** |
-| `database.js` | 含付费内容英文原文,**禁止推到公网仓库** |
+| `database.js` / `*.md`(导出目录里的) | 含付费内容英文原文,**禁止推到公网仓库** |
 | `economist_cookies.json` / `cookies*.json` | 含登录凭据,`.gitignore` 已覆盖,**禁止入库** |
 | Cookie 传输 | **永远不要发到任何 AI 对话 / 工单 / 公开频道** — 用本地的 `--import-cookies` 走 |
 | 抓取范围 | 仅限**个人付费账号**,不应用于商业分发 |
@@ -124,6 +124,7 @@ sync_weekly.py 内的 DEFAULTS dict(结构化兜底值)
 | `paths.database_js` | `DATABASE_JS_PATH` | 数据库落盘路径 |
 | `paths.index_html` | `INDEX_HTML_PATH` | 自包含 index.html 输出路径 |
 | `paths.index_template` | `INDEX_HTML_TEMPLATE` | index.html 模板路径 |
+| `paths.article_md_dir` | `ARTICLE_MD_DIR` | 每篇文章导出 `.md` 的目录(留空 = 不导出) |
 
 ## 5. CLI 用法
 
@@ -178,7 +179,40 @@ INDEX_HTML_TEMPLATE=/Users/luzhe/Desktop/code/agent_skills/economist_weekly_arch
 
 实现细节见 `sync_weekly.build_index_html()`,单元测试在 `tests/test_build_index_html.py`。
 
-### 5.3 `--import-cookies`(替代手动登录)
+### 5.3 单篇文章 `.md` 导出(可选)
+
+如果想把每篇文章单独存成 **干干净净的英文原文** Markdown(便于导入 Obsidian / Notion / Logseq 等知识库、做文本分析、或本地全文搜索),在 `.env` 里加一行:
+
+```bash
+ARTICLE_MD_DIR=/Users/luzhe/Desktop/economist_md_archive
+```
+
+之后**每抓一篇**会自动落盘到 `{ARTICLE_MD_DIR}/{article.id}.md`。**每个 `.md` 文件只有英文原文**(无 front matter、无标题、无摘要、无链接、无 Markdown 包装):
+
+```text
+WHEN ERIC STALLARD, an actuary and academic, began looking into the incidence of dementia among elderly Americans, he was so stunned by his findings that he held off publishing his first paper on the subject for two and a half years while he double-checked his work...
+
+Making memories
+
+Big questions remain about why dementia rates are falling and whether they will continue to drop...
+```
+
+特性:
+- **零包装**:文件内容 = `content_raw.strip()`,与 `database.js` 中的 `content_raw` 字段 1:1 对应
+- **原子写**(同 id 重抓会**覆盖**更新,不是新增多份)
+- **文件名 = `article.id`**(已规范、零冲突、零排序问题)
+- **失败只 `log.warning`**,不影响抓取主流程
+- 配合**自包含** `INDEX_HTML_PATH`:数据库、内联 HTML、独立 .md 三件套任意选
+
+文件名示例:
+```
+$ARTICLE_MD_DIR/
+├── art_2026-07-10_001.md
+├── art_2026-07-10_002.md
+└── ...
+```
+
+### 5.4 `--import-cookies`(替代手动登录)
 
 如果你在别的浏览器已经登录了 Economist、但当前机器拿不到验证码:
 

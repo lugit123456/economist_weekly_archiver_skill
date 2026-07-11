@@ -54,8 +54,18 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 | | |
 |---|---|
 | **输入** | `.env`(所有凭据 / 路径 / 调优参数);`sync_weekly.py` 内的 `DEFAULTS` dict 提供结构化兜底;Chrome profile 已登录状态 |
-| **输出** | `database.js`(每抓一篇追加);`logs/sync_YYYYMMDD.log`;可选飞书卡片 |
+| **输出** | `database.js`(每抓一篇追加);可选 `{ARTICLE_MD_DIR}/art_*.md`(每篇独立 .md,只含英文原文);可选 `INDEX_HTML_PATH`(自包含 index.html,数据库内联);`logs/sync_YYYYMMDD.log`;可选飞书卡片 |
 | **运行时长** | 47 篇 × 5-10s 间隔 ≈ 4-8 分钟抓正文,加 LLM 调用整体 10-30 分钟 |
+
+## 产物构件(可独立启用)
+
+每篇抓完后,根据 `.env` 配置,可同时产生最多三件互不依赖的产物:
+
+| 产物 | 触发 env 变量 | 内容 | 默认 |
+|------|------|------|------|
+| `database.js` | `DATABASE_JS_PATH` | 全量 JSON 数组,供 index.html 加载 | 项目根 `database.js` |
+| `art_<id>.md` | `ARTICLE_MD_DIR` | 单篇英文原文,**零包装**(纯 `content_raw.strip()`) | 关闭,需手动配 |
+| `index.html`(自包含) | `INDEX_HTML_PATH` | 数据库内联进 HTML 模板,可双击即用 | 关闭,需手动配 |
 
 ## 核心不变量
 
@@ -67,7 +77,7 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 
 ## 安全红线
 
-- `database.js` 含付费原文,**禁止推到公网仓库**(.gitignore 已覆盖,但仍要自己确认)
+- `database.js` 和 `{ARTICLE_MD_DIR}/art_*.md` 都含付费原文,**禁止推到公网仓库**(用户应自行在 `.gitignore` 加入对应的目录模式)
 - 所有真实配置只放 `.env`(API Key、Webhook、Base URL、路径、调优参数),已加 `.gitignore`,**禁止入库**
 - **Cookie 永远不要发到任何 AI 对话 / 工单 / 公开频道** — 本地 `--import-cookies` 走,全程不出本机
 

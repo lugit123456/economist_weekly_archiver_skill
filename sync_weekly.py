@@ -152,6 +152,7 @@ DEFAULTS = {
         "database_js": "",   # 空 = 用全局 DATABASE_JS(项目根/database.js)
         "index_html": "",    # 空 = 不生成自包含 index.html(只用项目根的)
         "index_template": "",  # 空 = 用项目根/index.html 当模板
+        "article_md_dir": "",  # 空 = 不导出 .md;填了则每篇文章单独一个 {id}.md
     },
 }
 
@@ -225,6 +226,7 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
         "paths.database_js": src.get("DATABASE_JS_PATH", "").strip(),
         "paths.index_html": src.get("INDEX_HTML_PATH", "").strip(),
         "paths.index_template": src.get("INDEX_HTML_TEMPLATE", "").strip(),
+        "paths.article_md_dir": src.get("ARTICLE_MD_DIR", "").strip(),
     }
     for dotted, val in overlay.items():
         if val == "" or val is False:
@@ -444,6 +446,67 @@ def _maybe_rebuild_index(cfg: dict[str, Any]) -> None:
         build_index_html(output_path, db_path, template_path)
     except Exception as e:
         log.warning(f"[index] 重建失败(不影响抓取):{e}")
+
+
+# ---------------------------------------------------------------------------
+# 单篇文章 .md 导出(可选)
+# ---------------------------------------------------------------------------
+
+
+def _article_to_markdown(article: dict[str, Any]) -> str:
+    """把一条 article 渲染为「干干净净的英文原文」(不要 front matter / 标题 / 摘要 / 链接等)。
+
+    只返回 content_raw.strip(),其它字段(title / summary_md / url / section 等)全部丢弃。
+    """
+    return (article.get("content_raw", "") or "").strip() + "\n"
+
+
+def write_article_md(article: dict[str, Any], output_dir: Path) -> Path:
+    """把一条 article 写为 {id}.md 到 output_dir。
+
+    - 原子写(临时文件 + os.replace)
+    - 文件名 = article.id(已规范,直接用)
+    - 创建 output_dir(如不存在)
+    - 覆盖已存在(同一 article.id 反复抓取应更新,而不是留多份)
+    返回最终文件路径。
+    """
+    if not article.get("id"):
+        raise ValueError("article 必须有 id 字段")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    content = _article_to_markdown(article)
+    out_path = output_dir / f"{article['id']}.md"
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f"{article['id']}.", suffix=".md.tmp", dir=output_dir
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_path, out_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        raise
+    return out_path
+
+
+def _maybe_export_article_md(cfg: dict[str, Any], article: dict[str, Any]) -> None:
+    """如果 paths.article_md_dir 已配置,把 article 写成 .md。
+
+    任何错误都只 log 不抛,不影响抓取主流程。
+    """
+    paths_cfg = cfg.get("paths") or {}
+    dir_str = paths_cfg.get("article_md_dir") or ""
+    if not dir_str:
+        return
+    output_dir = Path(dir_str)
+    try:
+        out = write_article_md(article, output_dir)
+        log.info(f"[md] 已导出 {article.get('id')}.md → {out} ({out.stat().st_size:,} bytes)")
+    except Exception as e:
+        log.warning(f"[md] 导出失败(不影响抓取):{e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1098,6 +1161,8 @@ def process_issue(
                 )
                 # 每篇落盘后顺便重建 index.html(自包含版),用户双击就能看
                 _maybe_rebuild_index(cfg)
+                # 每篇落盘后顺手导出 .md(如 .env 配置了 ARTICLE_MD_DIR)
+                _maybe_export_article_md(cfg, article)
             except Exception as e:
                 log.error(f"写盘失败 {url}:{e},该篇未持久化,下轮会重试")
                 # 回滚内存里的累计,避免误以为已落盘
@@ -1352,6 +1417,7 @@ def process_single_url(
         write_database_js(existing_after + [article])
         log.info(f"[single-url] ✓ 已写入: {article['id']} - {article['title']}")
         _maybe_rebuild_index(cfg)
+        _maybe_export_article_md(cfg, article)
 
         if not no_feishu:
             push_feishu(cfg, build_feishu_card([article], article["issue_date"]), log)
