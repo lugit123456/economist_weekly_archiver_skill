@@ -53,7 +53,7 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 
 | | |
 |---|---|
-| **输入** | `.env`(LLM API key、飞书 webhook);`config.json`(模型、延迟、Chrome profile 路径);Chrome profile 已登录状态 |
+| **输入** | `.env`(所有凭据 / 路径 / 调优参数);`sync_weekly.py` 内的 `DEFAULTS` dict 提供结构化兜底;Chrome profile 已登录状态 |
 | **输出** | `database.js`(每抓一篇追加);`logs/sync_YYYYMMDD.log`;可选飞书卡片 |
 | **运行时长** | 47 篇 × 5-10s 间隔 ≈ 4-8 分钟抓正文,加 LLM 调用整体 10-30 分钟 |
 
@@ -68,7 +68,7 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 ## 安全红线
 
 - `database.js` 含付费原文,**禁止推到公网仓库**(.gitignore 已覆盖,但仍要自己确认)
-- `config.json` 不含敏感凭据(已在 .gitignore);**真实 API Key 和 Webhook 放 `.env`**
+- 所有真实配置只放 `.env`(API Key、Webhook、Base URL、路径、调优参数),已加 `.gitignore`,**禁止入库**
 - **Cookie 永远不要发到任何 AI 对话 / 工单 / 公开频道** — 本地 `--import-cookies` 走,全程不出本机
 
 ## 许可

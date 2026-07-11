@@ -39,12 +39,11 @@ economist_weekly_archiver_skill/
 ├── database.js       # 数据持久层(window.economist_db 数组)
 │
 ├── sync_weekly.py    # 主入口:周抓取 + LLM 总结 + 持久化 + 飞书推送
-├── config.json       # 非敏感默认参数(模型、延迟、Chrome profile 路径)
 ├── requirements.txt  # Python 依赖
-├── .env.example      # 真实凭据模板(LLM_API_KEY / FEISHU_WEBHOOK_URL)
+├── .env.example      # 配置模板(复制成 .env,所有配置都在这里)
 │
 ├── logs/             # 运行日志(sync_YYYYMMDD.log)
-└── tests/            # 单元测试(117 个用例)
+└── tests/            # 单元测试
 ```
 
 ## 4. 快速开始
@@ -104,22 +103,27 @@ p.get('https://www.economist.com/weeklyedition')
 
 ### 4.4 配置加载顺序
 
+所有配置都在 `.env` 里(sync_weekly.py 内的 `DEFAULTS` dict 提供结构化兜底值)。加载顺序:
+
 ```
-config.json(结构化默认值)
+sync_weekly.py 内的 DEFAULTS dict(结构化兜底值)
     ↓ overlay
-.env(覆盖敏感字段)
-    ↓ overlay
-OS 环境变量(优先级最高)
+.env / 操作系统环境变量(优先级最高,空字符串视为未设置)
 ```
 
-| 字段 | 来源 | 说明 |
+| 字段 | 环境变量 | 说明 |
 |------|------|------|
-| `llm.model` / `max_tokens` / `temperature` | `config.json` | 非敏感,适合入库 |
-| `llm.api_key` | `.env` → `LLM_API_KEY` | 必填,不入库 |
-| `llm.base_url` | `.env` → `LLM_BASE_URL` | 自建网关;留空走官方 |
-| `feishu.webhook_url` | `.env` → `FEISHU_WEBHOOK_URL` | 留空则不推送 |
-| `browser.user_data_path` | `config.json` | Chrome 复用 profile 路径 |
-| `crawl.delay_min_s/max_s` | `config.json` | 防风控抖动范围 |
+| `llm.model` / `max_tokens` / `temperature` / `timeout_s` | `LLM_MODEL` / `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` / `LLM_TIMEOUT_S` | 非敏感,留空走 `DEFAULTS` |
+| `llm.api_key` | `LLM_API_KEY` | **必填** |
+| `llm.base_url` | `LLM_BASE_URL` | 自建网关;留空走官方 |
+| `feishu.webhook_url` | `FEISHU_WEBHOOK_URL` | 留空则不推送 |
+| `browser.user_data_path` | `BROWSER_USER_DATA_PATH` | Chrome 复用 profile 路径 |
+| `browser.headless` | `BROWSER_HEADLESS` | `true` / `1` / `yes` 启用 |
+| `crawl.delay_min_s/max_s` | `CRAWL_DELAY_MIN_S` / `CRAWL_DELAY_MAX_S` | 防风控抖动范围 |
+| `crawl.max_retries` | `CRAWL_MAX_RETRIES` | LLM 重试次数 |
+| `paths.database_js` | `DATABASE_JS_PATH` | 数据库落盘路径 |
+| `paths.index_html` | `INDEX_HTML_PATH` | 自包含 index.html 输出路径 |
+| `paths.index_template` | `INDEX_HTML_TEMPLATE` | index.html 模板路径 |
 
 ## 5. CLI 用法
 
@@ -141,6 +145,7 @@ python sync_weekly.py --issue 2026-06-27 --dry-run --debug-html /tmp/econ-debug
 
 python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json  # 灌 cookie
 python sync_weekly.py --kill-stale         # 杀掉残留 Chrome + 删 lock(默认也会自动做)
+python sync_weekly.py --rebuild-index      # 仅根据 database.js 重新生成自包含 index.html
 ```
 
 ### 5.1 `--issue` 周六校验
@@ -155,7 +160,25 @@ python sync_weekly.py --kill-stale         # 杀掉残留 Chrome + 删 lock(默�
 | `--issue 2026-07-13`(周一) | ✗ 拒绝,日志:`2026-07-13 是周一,不是周六。…` |
 | 不传 `--issue` | 访问 `/weeklyedition`(最新一期,默认行为) |
 
-### 5.2 `--import-cookies`(替代手动登录)
+### 5.2 自包含 `index.html` 生成(方案 A)
+
+如果你希望 `index.html` 跟 `database.js` 物理分离(比如 `index.html` 放在桌面、`database.js` 放在项目目录),或者想把归档页面拷到任何位置独立打开,只要在 `.env` 里配置 3 行:
+
+```bash
+DATABASE_JS_PATH=/Users/luzhe/Desktop/code/agent_skills/economist_weekly_archiver_skill/database.js
+INDEX_HTML_PATH=/Users/luzhe/Desktop/economist_reading/index.html   # 桌面上的任意位置
+INDEX_HTML_TEMPLATE=/Users/luzhe/Desktop/code/agent_skills/economist_weekly_archiver_skill/index.html
+```
+
+之后:
+
+- **每抓一篇**都会自动重建 `INDEX_HTML_PATH`(把数据库整段内联进 HTML,不再依赖外部 `database.js`)
+- 重建后的 HTML 是**自包含的**,拷到任何机器、U盘、邮件附件,双击即用
+- **手动重建**:`python sync_weekly.py --rebuild-index`(不抓取,只重建)
+
+实现细节见 `sync_weekly.build_index_html()`,单元测试在 `tests/test_build_index_html.py`。
+
+### 5.3 `--import-cookies`(替代手动登录)
 
 如果你在别的浏览器已经登录了 Economist、但当前机器拿不到验证码:
 
@@ -204,7 +227,7 @@ open index.html
 
 | 现象 | 排查 |
 |------|------|
-| `config.json 不存在` | 仓库已带,确认路径 |
+| `config.json 不存在` | 不再需要 — 所有配置在 `.env` 里 |
 | `LLM_API_KEY 未配置` | 复制 `.env.example` 到 `.env` 并填入真实 key |
 | 抓不到文章 | 跑 `python sync_weekly.py --dry-run --debug-html /tmp/econ-debug`,看 `[weekly]` 诊断行和导出的 HTML |
 | 浏览器连接 9222 失败 | 不需要,代码已用 `_find_free_port` + `set_address('127.0.0.1:XXXXX')` 自动处理 |

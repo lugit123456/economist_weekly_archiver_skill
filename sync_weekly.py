@@ -113,13 +113,47 @@ SUMMARY_SYSTEM_PROMPT: str = """\
 # ---------------------------------------------------------------------------
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "config.json"
 DATABASE_JS = ROOT / "database.js"
 LOGS_DIR = ROOT / "logs"
 
 CN_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
 MIN_CN_CHARS = 300
 MIN_EN_CHARS = 1000
+
+# ---------------------------------------------------------------------------
+# 默认配置(全部从 .env 覆盖,默认值在这里 hardcode)
+# ---------------------------------------------------------------------------
+DEFAULTS = {
+    "llm": {
+        "provider": "openai",
+        "api_key": "",
+        "base_url": "",
+        "model": "gpt-4o-mini",
+        "max_tokens": 2048,
+        "temperature": 0.4,
+        "timeout_s": 60,
+    },
+    "feishu": {
+        "webhook_url": "",
+        "enabled": True,
+    },
+    "browser": {
+        # Chrome 复用 profile 路径(Mac 默认位置,Windows/Linux 可在 .env 覆盖)
+        "user_data_path": "/Users/luzhe/.economist_archive/chrome_profile",
+        "headless": False,
+    },
+    "crawl": {
+        "issue_default": "latest",
+        "delay_min_s": 5,
+        "delay_max_s": 10,
+        "max_retries": 2,
+    },
+    "paths": {
+        "database_js": "",   # 空 = 用全局 DATABASE_JS(项目根/database.js)
+        "index_html": "",    # 空 = 不生成自包含 index.html(只用项目根的)
+        "index_template": "",  # 空 = 用项目根/index.html 当模板
+    },
+}
 
 # ---------------------------------------------------------------------------
 # 日志
@@ -151,46 +185,71 @@ log = setup_logger()
 # ---------------------------------------------------------------------------
 
 
-def load_config(
-    config_path: Path | None = None,
-    env: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    """加载 config.json,并用环境变量覆盖敏感字段。
+def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
+    """从 DEFAULTS 起步,用 .env / 环境变量覆盖任何字段。
 
-    环境变量约定(均为可选;只有 LLM_API_KEY 是 LLM 调用所必需的):
-      LLM_API_KEY        → llm.api_key
-      LLM_BASE_URL       → llm.base_url(空字符串等价于未设置)
-      LLM_MODEL          → llm.model
-      FEISHU_WEBHOOK_URL → feishu.webhook_url(空字符串等价于未设置)
+    所有配置都集中在 .env(详见 .env.example),不再依赖 config.json。
 
-    设计:
-      - config.json 提供结构化默认值(model/temperature/max_tokens/timeout/crawl 等)
-      - 真实凭据(api_key / webhook)只放在 .env / 环境变量里,不入库
-      - env 覆盖 json(后写优先),便于 CI / 本地临时切换
+    环境变量约定(均可选,只有 LLM_API_KEY 是 LLM 调用所必需的):
+      LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
+        → llm.api_key / llm.base_url / llm.model
+      FEISHU_WEBHOOK_URL → feishu.webhook_url
+      DATABASE_JS_PATH / INDEX_HTML_PATH / INDEX_HTML_TEMPLATE → paths.*
+      LLM_MAX_TOKENS / LLM_TEMPERATURE / LLM_TIMEOUT_S → llm.*
+      BROWSER_USER_DATA_PATH / BROWSER_HEADLESS → browser.*
+      CRAWL_DELAY_MIN_S / CRAWL_DELAY_MAX_S / CRAWL_MAX_RETRIES → crawl.*
 
-    `config_path` 默认惰性查找 CONFIG_PATH,以便测试时 monkeypatch 生效。
+    设计:DEFAULTS 提供结构化默认值,所有真实配置在 .env 里覆盖,不入库。
+    env 覆盖 DEFAULTS(后写优先),便于 CI / 本地临时切换。
     """
     # 每次读 config 前确保 .env 已加载
     _load_dotenv()
-    if config_path is None:
-        config_path = CONFIG_PATH
-    if not config_path.exists():
-        sys.exit(f"config.json 不存在: {config_path}")
-    with config_path.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
+
+    import copy
+    cfg = copy.deepcopy(DEFAULTS)
 
     src = env if env is not None else os.environ
     overlay = {
         "llm.api_key": src.get("LLM_API_KEY", "").strip(),
         "llm.base_url": src.get("LLM_BASE_URL", "").strip(),
         "llm.model": src.get("LLM_MODEL", "").strip(),
+        "llm.max_tokens": src.get("LLM_MAX_TOKENS", "").strip(),
+        "llm.temperature": src.get("LLM_TEMPERATURE", "").strip(),
+        "llm.timeout_s": src.get("LLM_TIMEOUT_S", "").strip(),
         "feishu.webhook_url": src.get("FEISHU_WEBHOOK_URL", "").strip(),
+        "browser.user_data_path": src.get("BROWSER_USER_DATA_PATH", "").strip(),
+        "browser.headless": src.get("BROWSER_HEADLESS", "").strip().lower() in ("1", "true", "yes"),
+        "crawl.delay_min_s": src.get("CRAWL_DELAY_MIN_S", "").strip(),
+        "crawl.delay_max_s": src.get("CRAWL_DELAY_MAX_S", "").strip(),
+        "crawl.max_retries": src.get("CRAWL_MAX_RETRIES", "").strip(),
+        "paths.database_js": src.get("DATABASE_JS_PATH", "").strip(),
+        "paths.index_html": src.get("INDEX_HTML_PATH", "").strip(),
+        "paths.index_template": src.get("INDEX_HTML_TEMPLATE", "").strip(),
     }
     for dotted, val in overlay.items():
-        if not val:
+        if val == "" or val is False:
             continue
         section, key = dotted.split(".", 1)
-        cfg.setdefault(section, {})[key] = val
+        cfg[section][key] = val
+
+    # 类型转换(LLM/爬虫调优参数都是数字);非法值静默回退到 DEFAULTS
+    int_fields = {
+        "llm": ["max_tokens", "timeout_s"],
+        "crawl": ["delay_min_s", "delay_max_s", "max_retries"],
+    }
+    for section, keys in int_fields.items():
+        for k in keys:
+            raw = cfg[section][k]
+            try:
+                cfg[section][k] = int(raw)
+            except (ValueError, TypeError):
+                cfg[section][k] = DEFAULTS[section][k]
+    try:
+        raw = cfg["llm"]["temperature"]
+        cfg["llm"]["temperature"] = float(raw)
+    except (ValueError, TypeError):
+        cfg["llm"]["temperature"] = DEFAULTS["llm"]["temperature"]
+
     return cfg
 
 
@@ -274,6 +333,117 @@ def _date_key(s: str) -> int:
         return int(datetime.strptime(s, "%Y-%m-%d").strftime("%Y%m%d"))
     except (ValueError, TypeError):
         return 0
+
+
+# ---------------------------------------------------------------------------
+# index.html 生成(把数据库内联进 HTML,产出可独立打开的自包含文件)
+# ---------------------------------------------------------------------------
+
+
+# 模板里这一行会被替换成内联脚本块
+_INDEX_TEMPLATE_MARKER = '<script src="database.js"></script>'
+
+
+def build_index_html(
+    output_path: Path,
+    db_path: Path,
+    template_path: Path,
+) -> bool:
+    """生成自包含的 index.html(数据库内联,不再依赖外部 database.js)。
+
+    工作流:
+      1) 读 template_path(index.html 模板,带 <script src="database.js"></script> 占位)
+      2) 读 db_path(合法 database.js)
+      3) 抽出 window.economist_db = [...] 数组
+      4) 把模板里的占位行替换成 <script>window.economist_db = [...] ;</script>
+      5) 原子写到 output_path(临时文件 + os.replace)
+
+    返回 True/False 表示是否成功。
+    """
+    try:
+        template = template_path.read_text(encoding="utf-8")
+    except Exception as e:
+        log.error(f"[index] 读模板失败 {template_path}:{e}")
+        return False
+
+    if _INDEX_TEMPLATE_MARKER not in template:
+        log.error(
+            f"[index] 模板缺少占位符 {_INDEX_TEMPLATE_MARKER!r},"
+            f"请确认 template_path 是新版 index.html"
+        )
+        return False
+
+    try:
+        db_text = db_path.read_text(encoding="utf-8")
+    except Exception as e:
+        log.error(f"[index] 读数据库失败 {db_path}:{e}")
+        return False
+
+    m = re.search(r"window\.economist_db\s*=\s*(\[.*\])\s*;", db_text, re.DOTALL)
+    if not m:
+        log.error(f"[index] 数据库格式异常,未找到 window.economist_db = [...]")
+        return False
+    array_str = m.group(1)
+
+    inline = (
+        "<script>\n"
+        "/* 自包含:数据已内联,无外部文件依赖 */\n"
+        f"window.economist_db = {array_str};\n"
+        "</script>"
+    )
+    rendered = template.replace(_INDEX_TEMPLATE_MARKER, inline)
+
+    # 原子写
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix="index.", suffix=".html.tmp", dir=output_path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(rendered)
+        os.replace(tmp_path, output_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        raise
+
+    log.info(
+        f"[index] ✓ 已生成自包含 index.html → {output_path}  "
+        f"({output_path.stat().st_size:,} bytes,含 {array_str.count(chr(34) + 'id' + chr(34))} 篇文章)"
+    )
+    return True
+
+
+def _maybe_rebuild_index(cfg: dict[str, Any]) -> None:
+    """如果 .env 配置了 paths.index_html / paths.index_template,重建自包含 index.html。
+
+    任何错误都只记 log 不抛,避免影响抓取主流程。
+    """
+    paths_cfg = cfg.get("paths") or {}
+    out_str = paths_cfg.get("index_html") or ""
+    if not out_str:
+        return  # 未配置 → 跳过(不影响流程)
+    template_str = paths_cfg.get("index_template") or ""
+    # 默认模板 = 当前项目里的 index.html(用户可以直接复用既有文件作为模板)
+    template_path = Path(template_str) if template_str else (ROOT / "index.html")
+    output_path = Path(out_str)
+
+    # db 路径优先用 cfg,否则用全局 DATABASE_JS
+    db_str = paths_cfg.get("database_js") or ""
+    db_path = Path(db_str) if db_str else DATABASE_JS
+
+    if not template_path.exists():
+        log.warning(f"[index] 模板不存在 {template_path},跳过重建")
+        return
+    if not db_path.exists():
+        log.warning(f"[index] 数据库不存在 {db_path},跳过重建")
+        return
+
+    try:
+        build_index_html(output_path, db_path, template_path)
+    except Exception as e:
+        log.warning(f"[index] 重建失败(不影响抓取):{e}")
 
 
 # ---------------------------------------------------------------------------
@@ -926,6 +1096,8 @@ def process_issue(
                     f"✓ 已收录并落盘: {article['id']} - {title[:60]}  "
                     f"(本 run 第 {len(new_articles)} 篇 / 累计 {len(existing)} 篇)"
                 )
+                # 每篇落盘后顺便重建 index.html(自包含版),用户双击就能看
+                _maybe_rebuild_index(cfg)
             except Exception as e:
                 log.error(f"写盘失败 {url}:{e},该篇未持久化,下轮会重试")
                 # 回滚内存里的累计,避免误以为已落盘
@@ -1096,6 +1268,8 @@ def parse_args() -> argparse.Namespace:
                    help="把 weeklyedition 页面 HTML 写到该目录,便于排查 0 条原因")
     p.add_argument("--kill-stale", action="store_true",
                    help="启动前杀掉残留 Chrome 进程 + 删 lock 文件(默认也会自动做一次)")
+    p.add_argument("--rebuild-index", action="store_true",
+                   help="仅根据 database.js + 模板重新生成 index.html(不抓取)")
     return p.parse_args()
 
 
@@ -1177,6 +1351,7 @@ def process_single_url(
         )
         write_database_js(existing_after + [article])
         log.info(f"[single-url] ✓ 已写入: {article['id']} - {article['title']}")
+        _maybe_rebuild_index(cfg)
 
         if not no_feishu:
             push_feishu(cfg, build_feishu_card([article], article["issue_date"]), log)
@@ -1200,6 +1375,18 @@ def main() -> int:
         )
         log.info(f"=== 结束  登录态:{'OK' if ok else 'FAIL'} ===")
         return 0 if ok else 1
+    if args.rebuild_index:
+        log.info("=== 仅重建 index.html(不抓取) ===")
+        ok = _maybe_rebuild_index(cfg) or _maybe_rebuild_index.__name__  # noqa: 保留调用
+        # _maybe_rebuild_index 内部已 log 成功/失败,这里只是兜底返回值
+        from pathlib import Path as _P
+        paths_cfg = cfg.get("paths") or {}
+        out = _P(paths_cfg.get("index_html", "")) if paths_cfg.get("index_html") else None
+        if out and out.exists():
+            log.info(f"=== 完成  index.html 在 {out} ({out.stat().st_size:,} bytes) ===")
+            return 0
+        log.error("=== 完成  index.html 未生成,检查 .env INDEX_HTML_PATH 配置 ===")
+        return 1
     if args.single_url:
         log.info(f"=== 启动 sync_weekly  single-url={args.single_url} ===")
         process_single_url(
