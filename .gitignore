@@ -1,0 +1,24 @@
+# Sensitive — never commit
+config.json
+config.local.json
+economist_cookies.json
+cookies*.json
+cookies*.txt
+*.cookies.json
+
+# Runtime artifacts
+logs/
+*.log
+database.js.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+.DS_Store

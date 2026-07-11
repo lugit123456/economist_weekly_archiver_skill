@@ -1,0 +1,3 @@
+window.economist_db = [
+
+];
