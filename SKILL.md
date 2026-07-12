@@ -54,7 +54,7 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 | | |
 |---|---|
 | **输入** | `.env`(所有凭据 / 路径 / 调优参数);`sync_weekly.py` 内的 `DEFAULTS` dict 提供结构化兜底;Chrome profile 已登录状态 |
-| **输出** | `database.js`(每抓一篇追加);可选 `{ARTICLE_MD_DIR}/art_*.md`(每篇独立 .md,只含英文原文);可选 `INDEX_HTML_PATH`(自包含 index.html,数据库内联);`logs/sync_YYYYMMDD.log`;可选飞书卡片 |
+| **输出** | `database.js`(每抓一篇追加);可选 `{ARTICLE_MD_DIR}/{issue_date}/{slug}-{id}.md`(按期分目录、标题 slug + id 命名);可选 `INDEX_HTML_PATH`(自包含 index.html,数据库内联);`logs/sync_YYYYMMDD.log`;可选飞书卡片 |
 | **运行时长** | 47 篇 × 5-10s 间隔 ≈ 4-8 分钟抓正文,加 LLM 调用整体 10-30 分钟 |
 
 ## 产物构件(可独立启用)
@@ -64,7 +64,7 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 | 产物 | 触发 env 变量 | 内容 | 默认 |
 |------|------|------|------|
 | `database.js` | `DATABASE_JS_PATH` | 全量 JSON 数组,供 index.html 加载 | 项目根 `database.js` |
-| `art_<id>.md` | `ARTICLE_MD_DIR` | 单篇英文原文,**零包装**(纯 `content_raw.strip()`) | 关闭,需手动配 |
+| `art_<id>.md` | `ARTICLE_MD_DIR` | 每篇英文原文,**零包装**(纯 `content_raw.strip()`);按 `issue_date` 分目录,文件名为 `{标题 slug}-{id}.md` | 关闭,需手动配 |
 | `index.html`(自包含) | `INDEX_HTML_PATH` | 数据库内联进 HTML 模板,可双击即用 | 关闭,需手动配 |
 
 ## 核心不变量

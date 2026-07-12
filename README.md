@@ -187,30 +187,27 @@ INDEX_HTML_TEMPLATE=/Users/luzhe/Desktop/code/agent_skills/economist_weekly_arch
 ARTICLE_MD_DIR=/Users/luzhe/Desktop/economist_md_archive
 ```
 
-之后**每抓一篇**会自动落盘到 `{ARTICLE_MD_DIR}/{article.id}.md`。**每个 `.md` 文件只有英文原文**(无 front matter、无标题、无摘要、无链接、无 Markdown 包装):
+之后**每抓一篇**会自动按以下结构落盘:
 
-```text
-WHEN ERIC STALLARD, an actuary and academic, began looking into the incidence of dementia among elderly Americans, he was so stunned by his findings that he held off publishing his first paper on the subject for two and a half years while he double-checked his work...
-
-Making memories
-
-Big questions remain about why dementia rates are falling and whether they will continue to drop...
-```
-
-特性:
-- **零包装**:文件内容 = `content_raw.strip()`,与 `database.js` 中的 `content_raw` 字段 1:1 对应
-- **原子写**(同 id 重抓会**覆盖**更新,不是新增多份)
-- **文件名 = `article.id`**(已规范、零冲突、零排序问题)
-- **失败只 `log.warning`**,不影响抓取主流程
-- 配合**自包含** `INDEX_HTML_PATH`:数据库、内联 HTML、独立 .md 三件套任意选
-
-文件名示例:
 ```
 $ARTICLE_MD_DIR/
-├── art_2026-07-10_001.md
-├── art_2026-07-10_002.md
-└── ...
+└── 2026-07-04/
+    ├── promised-reforms-could-change-cuba-radically-art_2026-07-04_019.md
+    ├── another-article-title-art_2026-07-04_020.md
+    └── ...
 ```
+
+设计细节:
+
+- **按 `issue_date` 分目录**:每篇文章自动放进 `{ARTICLE_MD_DIR}/{YYYY-MM-DD}/` 子目录,便于按期翻阅、跨期搜索不冲突
+- **文件名 = 标题 slug + id**:`Promised reforms could change Cuba radically` → `promised-reforms-could-change-cuba-radically-art_2026-07-04_019.md`
+  - **kebab-case slug**:小写、非字母数字/汉字转 `-`、连续 `-` 合并
+  - **截断保护**:超长标题(默认 60 字符)在最近的 `-` 边界截断,避免切到单词中间
+  - **id 在末尾**:稳定、可 grep `art_2026-07-04_019` 精确命中
+  - **空标题** → 文件名只保留 `art_xxx.md`
+- **md 内容 = 仅 `content_raw.strip()`**(零 front matter、零标题、零摘要、零链接包装)
+- 原子写(同 id 重抓会**覆盖**更新)
+- 失败只 `log.warning`,不影响抓取主流程
 
 ### 5.4 `--import-cookies`(替代手动登录)
 

@@ -461,22 +461,74 @@ def _article_to_markdown(article: dict[str, Any]) -> str:
     return (article.get("content_raw", "") or "").strip() + "\n"
 
 
-def write_article_md(article: dict[str, Any], output_dir: Path) -> Path:
-    """把一条 article 写为 {id}.md 到 output_dir。
+# 文件名里标题部分的最大长度(超出按 word boundary 截断)
+_MAX_TITLE_LEN = 60
 
+
+def _slugify_title(title: str, max_len: int = _MAX_TITLE_LEN) -> str:
+    """把标题转成适合做文件名的 slug。
+
+    - 全小写
+    - 非字母数字 / 中文字符 → -
+    - 连续 - 合并
+    - 去掉首尾 -
+    - 长度限制(超出在最近的 - 边界截断,避免切到一半单词)
+    - 空标题返回空字符串(让调用方只拿 id 命名)
+    """
+    if not title:
+        return ""
+    slug = re.sub(r"[^A-Za-z0-9\u4e00-\u9fff]+", "-", title).strip("-").lower()
+    if len(slug) <= max_len:
+        return slug
+    # 在 max_len 之前的最后一个 - 处截断,避免切到单词中间
+    truncated = slug[:max_len]
+    last_dash = truncated.rfind("-")
+    if last_dash > max_len // 2:
+        truncated = truncated[:last_dash]
+    return truncated.strip("-")
+
+
+def _article_filename(article: dict[str, Any]) -> str:
+    """构造文件名:`{slug-title}-{id}.md`。
+
+    - 标题太短或为空 → 只用 `{id}.md`
+    - 标题 slug 截断后为空 → 只用 `{id}.md`
+    - 标题 + id 之间用 `-` 拼接,便于 grep / Tab 补全 / 跨软件引用
+    """
+    art_id = article.get("id", "").strip()
+    if not art_id:
+        raise ValueError("article 必须有 id 字段")
+    slug = _slugify_title(article.get("title", "") or "")
+    if not slug:
+        return f"{art_id}.md"
+    return f"{slug}-{art_id}.md"
+
+
+def write_article_md(article: dict[str, Any], output_dir: Path) -> Path:
+    """把一条 article 写到 output_dir / {issue_date} / {slug-title}-{id}.md。
+
+    - 在 output_dir 下按 issue_date(YYYY-MM-DD)建子目录,便于按期翻阅
+    - 文件名 = 标题 slug + id(便于 grep / Tab 补全 / 跨软件引用)
     - 原子写(临时文件 + os.replace)
-    - 文件名 = article.id(已规范,直接用)
-    - 创建 output_dir(如不存在)
+    - 创建中间目录(如不存在)
     - 覆盖已存在(同一 article.id 反复抓取应更新,而不是留多份)
     返回最终文件路径。
     """
-    if not article.get("id"):
+    art_id = article.get("id", "").strip()
+    if not art_id:
         raise ValueError("article 必须有 id 字段")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    issue_date = article.get("issue_date", "").strip()
+    if not issue_date:
+        # 兜底:缺 issue_date 时直接放根目录,不强行猜目录名
+        sub_dir = output_dir
+    else:
+        sub_dir = output_dir / issue_date
+    sub_dir.mkdir(parents=True, exist_ok=True)
+
     content = _article_to_markdown(article)
-    out_path = output_dir / f"{article['id']}.md"
+    out_path = sub_dir / _article_filename(article)
     fd, tmp_path = tempfile.mkstemp(
-        prefix=f"{article['id']}.", suffix=".md.tmp", dir=output_dir
+        prefix=f"{out_path.name}.", suffix=".tmp", dir=sub_dir
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -504,7 +556,7 @@ def _maybe_export_article_md(cfg: dict[str, Any], article: dict[str, Any]) -> No
     output_dir = Path(dir_str)
     try:
         out = write_article_md(article, output_dir)
-        log.info(f"[md] 已导出 {article.get('id')}.md → {out} ({out.stat().st_size:,} bytes)")
+        log.info(f"[md] 已导出 {out.name} → {out} ({out.stat().st_size:,} bytes)")
     except Exception as e:
         log.warning(f"[md] 导出失败(不影响抓取):{e}")
 
