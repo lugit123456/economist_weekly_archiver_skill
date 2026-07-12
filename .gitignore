@@ -1,5 +1,5 @@
 # Sensitive — never commit
-config.json
+# config.json 已废弃,所有配置移至 .env
 config.local.json
 economist_cookies.json
 cookies*.json
@@ -10,6 +10,10 @@ cookies*.txt
 logs/
 *.log
 database.js.bak
+economist_cookies.json
+
+# database.js 现在入 git(给 Netlify 用),不再 ignore
+# 若想纯本地部署(只用 netlify deploy --prod --dir=.),可重新 ignore 它
 
 # Python
 __pycache__/
@@ -22,3 +26,6 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# Netlify
+.netlify/

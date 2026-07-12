@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 唯一标识符(命名建议:反向域名 + 项目名 + 调度周期) -->
+    <key>Label</key>
+    <string>com.economist.archiver.weekly</string>
+
+    <!-- 实际执行的命令
+         __PROJECT_DIR__ 是占位符,deploy 前由 install_launchd.sh 替换为绝对路径 -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>__PROJECT_DIR__/run_weekly_sync.sh</string>
+    </array>
+
+    <!-- 脚本执行的工作目录(__PROJECT_DIR__ 同样会被替换) -->
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <!--
+      launchd 跑的环境 PATH 极简(只有 /usr/bin:/bin:/usr/sbin:/sbin),
+      python3 / git / brew 工具链都找不到。把常用路径加进去:
+        /opt/homebrew/bin    ← Apple Silicon Mac 自带 Homebrew
+        /usr/local/bin       ← Intel Mac + Homebrew 旧位置
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!--
+      调度:每周五 20:00 触发
+      Weekday: 0=周日, 1=周一, ..., 5=周五, 6=周六
+      注意:launchd 的调度是 24h 制本地时间
+    -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>5</integer>
+        <key>Hour</key>
+        <integer>20</integer>
+    </dict>
+
+    <!-- 标准输出 / 错误输出重定向到文件(便于排错) -->
+    <key>StandardOutPath</key>
+    <string>/tmp/economist-archiver-launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/economist-archiver-launchd.err.log</string>
+
+    <!--
+      进程行为:
+        RunAtLoad=false  ← 不要加载时立即跑(只在定时点跑)
+        KeepAlive=false   ← 不要持续保活
+    -->
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>

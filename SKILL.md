@@ -17,6 +17,7 @@ description: |
 - 想补抓 weekly edition 目录里漏掉或抓失败的某一篇
 - 已在别的浏览器登录了《经济学人》、但本机拿不到验证码,想把 cookie 灌过来
 - 想要离线可搜索、可对照原文的个人知识库
+- **想分享给朋友看**:`./deploy_to_netlify.sh` 一键部署,朋友只需要 URL 就能浏览自包含 SPA
 
 **不要用本 skill 做的事**:
 - 抓取 politics / business / finance / united-states / china / asia / europe 等板块 — 已被板块白名单过滤掉
@@ -74,6 +75,21 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 - 文章字段:`issue_date` / `id`(`art_<date>_NNN`) / `section` / `title` / `url` / `summary_md`(≥300 中文字)/ `content_raw`(≥1000 字符)
 - 每周六才发布,非周六日期 `--issue` 直接拒绝
 - LLM 摘要里若混入英文思考链,自动从 `🌟 一句话核心主旨` 开始截取
+
+## 完全自动化(Mac)
+
+`launchd/com.economist.archiver.weekly.plist` 提供 macOS launchd 一键调度配置(每周五 20:00 触发 `run_weekly_sync.sh`):
+
+```bash
+cp launchd/com.economist.archiver.weekly.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.economist.archiver.weekly.plist
+# 立即手动触发验证
+launchctl start com.economist.archiver.weekly
+# 看日志
+tail -f /tmp/economist-archiver-launchd.out.log
+```
+
+完全自动化流程:launchd 触发 → `run_weekly_sync.sh`(抓取 + copy + `git push`) → GitHub → Netlify 自动 redeploy → 朋友看到最新内容。配置一次后**完全不动手**。
 
 ## 安全红线
 

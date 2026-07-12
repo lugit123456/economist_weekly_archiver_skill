@@ -1,0 +1,28 @@
+# =============================================================================
+# Netlify 静态托管配置
+# 用途:把 index.html (含自包含数据库) + database.js 当静态站托管
+# 端用户访问 Netlify URL,看到的只是一个 React 风格的 SPA,完全无感
+# =============================================================================
+
+[build]
+  publish = "."
+
+# 把根路径 / 重定向到 index.html
+[[redirects]]
+  from = "/"
+  to = "/index.html"
+  status = 200
+
+# 安全 headers(只动 server-rendered 资源,不影响功能)
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+
+# 数据库文件不进 CDN 缓存(每周都更新,缓存反而坑用户)
+[[headers]]
+  for = "/database.js"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"

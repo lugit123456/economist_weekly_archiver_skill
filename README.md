@@ -362,7 +362,116 @@ python3 -m pytest tests/ -v
 - 50 周 × 8 篇 ≈ 4 MB
 - `database.js` 接近 10 MB 时建议迁移 SQLite(v2,见 `DEVELOPMENT.md` §11)
 
-## 11. 许可
+## 11. 部署到 Netlify(分享给朋友看)
+
+把 `index.html`(自包含,含数据库内联)和 `database.js` 当静态站托管,**朋友只需打开一个 URL,看不到任何代码**。
+
+### 一次性配置(~30 分钟)
+
+```bash
+# 1) 装 Netlify CLI
+npm install -g netlify-cli
+
+# 2) 浏览器登录一次
+netlify login
+
+# 3) 关联项目到 Netlify site
+cd /Users/luzhe/Desktop/code/agent_skills/economist_weekly_archiver_skill
+netlify init
+
+# 4) 推项目到 GitHub(repo 设为 private,避免 database.js 公开)
+git init  # 如果还没 git
+git add .
+git commit -m "init"
+# 在 github.com 新建一个 private repo,然后:
+git remote add origin https://github.com/<yourname>/economist-archiver.git
+git push -u origin master
+```
+
+`netlify.toml` 已包含在项目里,**publish = "."** 表示直接托管项目根。
+
+### 工作流对比
+
+| 方案 | 触发方式 | Mac 依赖 | 适合 |
+|------|---------|---------|------|
+| **A. Mac 本地 + git push**(推荐) | launchd 每周五自动跑 `run_weekly_sync.sh` | 需开机 | 你想**完全不动手** |
+| **B. Mac 本地 + Netlify CLI** | 手动跑 `./deploy_to_netlify.sh` | 需开机(手动时) | 想**先验证再自动化** |
+| **C. GitHub Actions** | 容器每周跑 cron | 不依赖 | 想**跑在云端** |
+
+### 方案 A(推荐,完全不动手)
+
+`run_weekly_sync.sh` 已经写好,每次运行会:
+
+1. 抓取 → 写 `database.js` 到 `.env` 的 `DATABASE_JS_PATH`
+2. 重建 `index.html` 到 `.env` 的 `INDEX_HTML_PATH`
+3. 把外部产物**拷贝到项目根**(给 Netlify 用)
+4. `git add database.js index.html` + commit + push
+5. Netlify 看到 push → 自动 redeploy
+
+**你 Mac 的 launchd 配一次**(`~/Library/LaunchAgents/com.economist.archiver.weekly.plist`),周五自动触发即可:
+
+```bash
+# 1) 项目根 launchd/com.economist.archiver.weekly.plist 用 __PROJECT_DIR__ 占位符
+# 2) 运行安装脚本(替换占位符 + 写 LaunchAgents + 可选加载)
+./install_launchd.sh
+# 或指定项目根:
+./install_launchd.sh /Users/luzhe/Desktop/code/agent_skills/economist_weekly_archiver_skill
+```
+
+`install_launchd.sh` 会:
+- 把 plist 里的 `__PROJECT_DIR__` 替换为脚本所在路径
+- 写到 `~/Library/LaunchAgents/com.economist.archiver.weekly.plist`
+- 用 `plutil -lint` 校验语法
+- 询问是否立刻 `launchctl load` + `launchctl start`
+
+之后**完全不用动**,每周五 Mac 自动跑 → git push → Netlify 自动 redeploy → 朋友看到最新内容。
+
+**plist 关键字段说明**:
+
+| 字段 | 作用 |
+|------|------|
+| `Label` | 唯一标识,`launchctl start com.economist.archiver.weekly` 触发用 |
+| `ProgramArguments` | `/bin/zsh <脚本绝对路径>`,必须绝对路径(用 `__PROJECT_DIR__` 占位符) |
+| `WorkingDirectory` | 双保险:脚本内部也会 cd |
+| `EnvironmentVariables.PATH` | launchd 默认 PATH 极简,必须显式把 Homebrew 加进去 |
+| `StartCalendarInterval.Weekday=5` | 周五(0=周日,5=周五) |
+| `StartCalendarInterval.Hour=20` | 20:00 触发(本地时间) |
+| `StandardOutPath` / `StandardErrorPath` | 排错时看这两个文件 |
+
+**修改 plist 后**:
+
+```bash
+# 1) 改 launchd/com.economist.archiver.weekly.plist(占位符形式)
+# 2) 重跑安装脚本
+./install_launchd.sh
+# 脚本会自动 unload 旧版 + load 新版
+```
+
+### 方案 B(手动验证,半天搞定)
+
+```bash
+# 抓取 + 重建 + copy + 部署 +(可选)git push
+./deploy_to_netlify.sh --issue 2026-07-11
+```
+
+跑一次就上 Netlify CDN。验证 OK 后再配 launchd 切到方案 A。
+
+### Netlify 配置要点
+
+1. **Import existing project** → 选 GitHub repo → Publish directory = `.` → Deploy
+2. Netlify 会给你一个 URL,类似 `https://xxx-xxxxx.netlify.app`
+3. 自定义域名(可选):Netlify 后台 → Domain settings → Add custom domain
+
+### 数据库安全提示
+
+`database.js` 现在**入 git**(为 Netlify 自动 redeploy 服务)。**repo 必须设 private**。一旦设为 public,所有付费内容公开。
+
+如果改主意想纯本地部署(不用 git push):
+- 把 `database.js` 加回 `.gitignore`
+- 用 `netlify deploy --prod --dir=.`(CLI 直接上传,不走 git)
+- 改用 `./deploy_to_netlify.sh`,把 git push 步骤注释掉
+
+## 12. 许可
 
 本 skill 代码:MIT。经济学人内容版权归 Economist Newspaper Ltd 所有。
 
