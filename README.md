@@ -12,7 +12,9 @@
 - 正文过短的文章不再跳过，卡通漫画栏也会保留并抓取图片。
 - 图片范围截止到页面 `Explore more` 之前，排除周刊封面等推荐区图片。
 - 图片下载到 `output_results/TE/{issue_date}/images/`，并生成 50-80 个中文字符的简短解析。
+- 每期封面使用 weekly edition 顶部的 `content.cover` 图片，保存为 `output_results/TE/{issue_date}/cover.jpg`。
 - 关键词解析生成 `glossary_entries` 和 `term_annotations`，用于前端定位和展示。
+- 浏览器抓取保持串行；正文编译和图片解析使用独立 LLM 队列并行执行。
 - URL 去重、逐篇写盘、可选英文 Markdown 导出、可选 Feishu 通知。
 
 ## 安全与版权
@@ -99,6 +101,18 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 
 图片解析会对每张图生成 50-80 个中文字符的描述，并标注 `photo`、`chart`、`cartoon` 或
 `illustration`。下载失败时保留远程 URL；没有图片时不产生解析记录。
+
+### 并发队列
+
+| 环境变量 | 说明 | 默认值 |
+|---|---|---|
+| `LLM_COMPILE_WORKERS` | 正文翻译、解读和关键词合并请求的并发数 | `2` |
+| `LLM_IMAGE_WORKERS` | 图片 vision 解析并发数 | `1` |
+| `LLM_MAX_PENDING` | 等待正文编译的最大文章数 | `4` |
+
+正文结构化结果会同时返回关键词，正常路径不再追加 glossary 请求。文章一完成正文编译即写入
+`database.js`；图片解析在独立队列完成后再回填。遇到 `422`、认证或参数错误不会重复重试，
+只会重试超时、连接错误、`429` 和服务端错误。
 
 ### 浏览器、输出与通知
 

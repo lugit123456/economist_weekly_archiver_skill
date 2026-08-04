@@ -29,3 +29,5 @@ venv/
 
 # Netlify
 .netlify/
+
+./output_results/*

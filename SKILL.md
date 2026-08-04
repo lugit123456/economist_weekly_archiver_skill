@@ -46,6 +46,7 @@ python sync_weekly.py --issue 2026-08-01 --refresh-images \
 
 - `database.js`：归档文章数据，逐篇写盘并按 URL 去重。
 - `output_results/TE/{issue_date}/images/`：下载后的正文图片。
+- `output_results/TE/{issue_date}/cover.jpg`：weekly edition 顶部的真实期刊封面。
 - `logs/sync_YYYYMMDD.log`：运行日志。
 - 可选 `ARTICLE_MD_DIR`：按期导出的英文 Markdown 原文。
 - 可选 `INDEX_HTML_PATH`：数据库内联后的自包含浏览页面。
@@ -53,6 +54,10 @@ python sync_weekly.py --issue 2026-08-01 --refresh-images \
 图片只取文章主体和明确的 `leadComponent`/`leadImage` 等字段，并限制在页面
 `Explore more` 之前；`weeklyEdition.cover`、`squareCover` 等周刊封面不会作为正文图片保存。
 每张图片可生成 50-80 个中文字符的 `image_insights`，说明图片、图表或漫画内容及其与文章的关系。
+
+浏览器访问始终串行；默认使用 2 个正文 LLM worker 和 1 个图片 LLM worker。正文请求会同时输出
+段落翻译、中文解读和关键词，图片解析完成后异步回填，不阻塞文章落库。可通过
+`LLM_COMPILE_WORKERS`、`LLM_IMAGE_WORKERS` 和 `LLM_MAX_PENDING` 调整并发。
 
 每篇文章还可以产生：
 

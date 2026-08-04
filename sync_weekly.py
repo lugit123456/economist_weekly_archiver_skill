@@ -17,6 +17,7 @@ import re
 import sys
 import tempfile
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -148,6 +149,11 @@ DEFAULTS = {
         "max_retries": 2,
         "max_images": 6,
     },
+    "pipeline": {
+        "compile_workers": 2,
+        "image_workers": 1,
+        "max_pending": 4,
+    },
     "paths": {
         "output_root": "",
         "database_js": "",   # 空 = 用全局 DATABASE_JS(项目根/database.js)
@@ -238,6 +244,9 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
         "image_analysis.max_tokens": src.get("LLM_IMAGE_ANALYSIS_MAX_TOKENS", "").strip(),
         "image_analysis.max_retries": src.get("LLM_IMAGE_ANALYSIS_MAX_RETRIES", "").strip(),
         "image_analysis.max_images": src.get("LLM_MAX_IMAGES_PER_ARTICLE", "").strip(),
+        "pipeline.compile_workers": src.get("LLM_COMPILE_WORKERS", "").strip(),
+        "pipeline.image_workers": src.get("LLM_IMAGE_WORKERS", "").strip(),
+        "pipeline.max_pending": src.get("LLM_MAX_PENDING", "").strip(),
         "paths.database_js": src.get("DATABASE_JS_PATH", "").strip(),
         "paths.output_root": src.get("OUTPUT_ROOT", "").strip(),
         "paths.index_html": src.get("INDEX_HTML_PATH", "").strip(),
@@ -256,6 +265,7 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
         "crawl": ["delay_min_s", "delay_max_s", "max_retries"],
         "glossary": ["max_terms", "max_tokens", "max_retries"],
         "image_analysis": ["max_tokens", "max_retries", "max_images"],
+        "pipeline": ["compile_workers", "image_workers", "max_pending"],
     }
     for section, keys in int_fields.items():
         for k in keys:
@@ -487,6 +497,7 @@ def _write_paper_issue_database(
     output_root: Path,
     issue_date: str,
     articles: list[dict[str, Any]],
+    cover_image: str = "",
 ) -> tuple[Path, str, dict[str, Any]]:
     issue_dir = output_root / PAPER_PUBLICATION_TYPE / issue_date
     database_path = issue_dir / "database.js"
@@ -495,13 +506,20 @@ def _write_paper_issue_database(
         _normalise_paper_article(article, index)
         for index, article in enumerate(articles, start=1)
     ]
+    if not cover_image and database_path.exists():
+        try:
+            previous = database_path.read_text(encoding="utf-8")
+            matched = re.search(r'"cover_image"\s*:\s*"([^"]*)"', previous)
+            cover_image = matched.group(1) if matched else ""
+        except Exception:
+            pass
     payload = {
         "id": pdf_id,
         "publication_type": PAPER_PUBLICATION_TYPE,
         "publication_date": issue_date,
         "original_filename": f"Economist Weekly - {issue_date}",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "cover_image": "",
+        "cover_image": cover_image,
         "article_count": len(normalized_articles),
         "glossary_version": GLOSSARY_VERSION,
         "glossary": _build_issue_glossary(articles),
@@ -524,6 +542,14 @@ def _write_paper_database_index(
     items: list[dict[str, Any]] = []
     for issue_date, issue_articles in grouped_articles.items():
         pdf_id = f"{PAPER_PUBLICATION_TYPE}_{issue_date}_economist-weekly"
+        cover_image = ""
+        issue_database = output_root / PAPER_PUBLICATION_TYPE / issue_date / "database.js"
+        try:
+            previous = issue_database.read_text(encoding="utf-8")
+            matched = re.search(r'"cover_image"\s*:\s*"([^"]*)"', previous)
+            cover_image = matched.group(1) if matched else ""
+        except Exception:
+            pass
         items.append(
             {
                 "id": pdf_id,
@@ -531,7 +557,7 @@ def _write_paper_database_index(
                 "publication_date": issue_date,
                 "original_filename": f"Economist Weekly - {issue_date}",
                 "database_path": f"{PAPER_PUBLICATION_TYPE}/{issue_date}/database.js",
-                "cover_image": "",
+                "cover_image": cover_image,
                 "article_count": len(issue_articles),
                 "sections": sorted({str(article.get("section") or "General") for article in issue_articles}),
                 "titles": [article.get("title") for article in issue_articles if article.get("title")],
@@ -547,11 +573,17 @@ def _sync_paper_outputs(
     cfg: dict[str, Any],
     articles: list[dict[str, Any]],
     issue_date: str | None = None,
+    issue_covers: dict[str, str] | None = None,
 ) -> None:
     output_root = _paper_output_root(cfg)
     grouped = _group_articles_by_issue(articles)
     for grouped_issue_date, issue_articles in grouped.items():
-        _write_paper_issue_database(output_root, grouped_issue_date, issue_articles)
+        _write_paper_issue_database(
+            output_root,
+            grouped_issue_date,
+            issue_articles,
+            cover_image=(issue_covers or {}).get(grouped_issue_date, ""),
+        )
     _write_paper_database_index(output_root, grouped)
 
 
@@ -964,7 +996,54 @@ def fetch_weekly_index(page, issue_date: str | None = None, debug_html_dir: Path
         (debug_html_dir / f"weekly_{stamp}.html").write_text(html_source, encoding="utf-8")
         log.info(f"[weekly] 已 dump 诊断 HTML 到 {debug_html_dir}/weekly_{stamp}.html")
 
-    return _parse_weeklyedition_html_v2(html_source)
+    articles = _parse_weeklyedition_html_v2(html_source)
+    cover_url = _weekly_cover_url_from_html(html_source) or _visible_weekly_cover_url(page)
+    if cover_url:
+        for article in articles:
+            article["cover_image_url"] = cover_url
+        log.info(f"[weekly] 已识别本期顶部封面图: {cover_url[:120]}")
+    else:
+        log.warning("[weekly] 未识别到本期顶部封面图，不影响文章抓取")
+    return articles
+
+
+def _weekly_cover_url_from_html(html: str) -> str:
+    """从 weekly edition 的结构化 content.cover 读取页面顶部期刊封面。"""
+    try:
+        matched = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', html)
+        if not matched:
+            return ""
+        payload = json.loads(matched.group(1).strip())
+        cover = payload.get("props", {}).get("pageProps", {}).get("content", {}).get("cover", {})
+        value = cover.get("url", "") if isinstance(cover, dict) else ""
+        return str(value) if _is_article_image_url(value) else ""
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+
+
+def _visible_weekly_cover_url(page) -> str:
+    """选取 weekly edition 首屏中面积最大的 Economist 图片作为期刊封面。"""
+    try:
+        value = page.run_js(
+            """
+            (() => Array.from(document.images)
+              .map(img => {
+                const rect = img.getBoundingClientRect();
+                return {
+                  src: img.currentSrc || img.src || '',
+                  top: rect.top,
+                  area: Math.max(rect.width, 0) * Math.max(rect.height, 0)
+                };
+              })
+              .filter(item => item.src && item.top > -80 && item.top < window.innerHeight * 1.5 && item.area > 12000)
+              .sort((left, right) => left.top - right.top || right.area - left.area)
+              .map(item => item.src)[0] || '')()
+            """
+        )
+    except Exception as exc:
+        log.warning(f"[weekly] 读取首屏封面图失败: {exc}")
+        return ""
+    return str(value or "") if _is_article_image_url(value) else ""
 
 
 def _parse_weeklyedition_html_v2(html: str) -> list[dict[str, str]]:
@@ -1238,6 +1317,29 @@ def materialize_article_images(
     return paths
 
 
+def materialize_issue_cover(cover_url: str, cfg: dict[str, Any], issue_date: str) -> str:
+    """下载 weekly edition 首屏封面，返回相对期刊目录的路径。"""
+    if not _is_article_image_url(cover_url):
+        return ""
+    try:
+        import requests
+
+        response = requests.get(
+            cover_url,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"},
+            timeout=30,
+        )
+        content_type = response.headers.get("Content-Type", "")
+        if response.status_code != 200 or not content_type.lower().startswith("image/"):
+            raise ValueError(f"HTTP {response.status_code}, Content-Type={content_type!r}")
+        target = _paper_output_root(cfg) / PAPER_PUBLICATION_TYPE / issue_date / f"cover{_image_extension(cover_url, content_type)}"
+        _write_atomic_bytes(target, response.content)
+        return target.name
+    except Exception as exc:
+        log.warning(f"[weekly] 封面图下载失败，不影响文章抓取: {exc}")
+        return ""
+
+
 def analyze_article_images(
     client: Any,
     cfg: dict[str, Any],
@@ -1338,6 +1440,8 @@ def analyze_article_images(
             )
         except Exception as exc:
             log_.warning(f"图片解析失败 (attempt {attempt + 1}): {exc}")
+            if not _should_retry_llm_error(exc, attempt, int(settings["max_retries"])):
+                break
     return []
 
 
@@ -1502,11 +1606,16 @@ def summarize(
             if cn_count >= MIN_CN_CHARS:
                 return final_chinese_summary
 
-            log_.warning(f"摘要纯净字数仍未达标({cn_count}<{MIN_CN_CHARS})，正在重新调用 LLM 跑流...")
+            if attempt >= 1:
+                last_err = ValueError(f"摘要纯净字数不足({cn_count}<{MIN_CN_CHARS})")
+                break
+            log_.warning(f"摘要纯净字数仍未达标({cn_count}<{MIN_CN_CHARS})，再重试一次")
 
         except Exception as e:
             last_err = e
             log_.warning(f"LLM 连线调用失败 (attempt {attempt + 1}): {e}")
+            if not _should_retry_llm_error(e, attempt, int(cfg["crawl"].get("max_retries", 2))):
+                break
 
         time.sleep(1.0)
 
@@ -1564,6 +1673,21 @@ def _extract_json_payload(text: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("LLM JSON 不是 object")
     return data
+
+
+def _should_retry_llm_error(exc: Exception, attempt: int, max_retries: int) -> bool:
+    """只重试短暂故障；422、认证和参数错误不会因重复请求而恢复。"""
+    if attempt >= max_retries:
+        return False
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code in {408, 409, 425, 429} or status_code >= 500
+    if isinstance(exc, json.JSONDecodeError):
+        return attempt == 0
+    message = str(exc).lower()
+    if "connection" in message or "timed out" in message or "timeout" in message:
+        return True
+    return "中文解读字数不合格" in str(exc) and attempt == 0
 
 
 def _normalise_compiled_paragraphs(
@@ -1631,43 +1755,19 @@ Return JSON ONLY:
 }}"""
 
 
-def enrich_article_glossary(
-    client: Any, cfg: dict[str, Any], article: dict[str, Any], log_: logging.Logger,
+def _apply_glossary_terms(
+    article: dict[str, Any], raw_terms: Any, complete: bool, max_terms: int | None = None,
 ) -> dict[str, Any]:
-    """按 auto-paper-md-converter 的 glossary schema 为文章添加可定位术语。"""
-    glossary_cfg = cfg["glossary"]
+    """校验模型返回并转成前端使用的 glossary 和段落定位结构。"""
     paragraphs = article.get("paragraphs") or []
-    if not glossary_cfg.get("enabled") or not any(p.get("zh_text") for p in paragraphs):
-        article["glossary_entries"] = []
-        article["term_annotations"] = []
-        article["glossary_analysis_complete"] = False
-        article["glossary_version"] = 0
-        return article
-
-    model = glossary_cfg.get("model") or cfg["llm"].get("model", "gpt-4o-mini")
-    prompt = _glossary_prompt(article["title"], paragraphs, max(1, int(glossary_cfg["max_terms"])))
-    raw_terms: Any = []
-    for attempt in range(int(glossary_cfg["max_retries"]) + 1):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "system", "content": "Return JSON only."}, {"role": "user", "content": prompt}],
-                max_tokens=int(glossary_cfg["max_tokens"]),
-                temperature=0.2,
-                response_format={"type": "json_object"},
-            )
-            raw_terms = _extract_json_payload(response.choices[0].message.content or "").get("terms", [])
-            break
-        except Exception as exc:
-            log_.warning(f"关键词解析失败 (attempt {attempt + 1}): {exc}")
-    if not isinstance(raw_terms, list):
-        raw_terms = []
-
     entries: list[dict[str, Any]] = []
     annotations: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
+    max_terms = max(1, int(max_terms or DEFAULTS["glossary"]["max_terms"]))
+    if not isinstance(raw_terms, list):
+        raw_terms = []
     for raw in raw_terms:
-        if len(entries) >= int(glossary_cfg["max_terms"]) or not isinstance(raw, dict):
+        if len(entries) >= max_terms or not isinstance(raw, dict):
             break
         term = str(raw.get("term") or raw.get("canonical_term") or "").strip()
         term_type = str(raw.get("type") or "proper_concept").strip().lower()
@@ -1705,15 +1805,51 @@ def enrich_article_glossary(
         annotations.extend(valid_occurrences[:1])
     article["glossary_entries"] = entries
     article["term_annotations"] = annotations
-    article["glossary_analysis_complete"] = True
-    article["glossary_version"] = GLOSSARY_VERSION
+    article["glossary_analysis_complete"] = complete
+    article["glossary_version"] = GLOSSARY_VERSION if complete else 0
     return article
+
+
+def enrich_article_glossary(
+    client: Any, cfg: dict[str, Any], article: dict[str, Any], log_: logging.Logger,
+) -> dict[str, Any]:
+    """按 auto-paper-md-converter 的 glossary schema 为文章添加可定位术语。"""
+    glossary_cfg = cfg["glossary"]
+    paragraphs = article.get("paragraphs") or []
+    if not glossary_cfg.get("enabled") or not any(p.get("zh_text") for p in paragraphs):
+        article["glossary_entries"] = []
+        article["term_annotations"] = []
+        article["glossary_analysis_complete"] = False
+        article["glossary_version"] = 0
+        return article
+
+    model = glossary_cfg.get("model") or cfg["llm"].get("model", "gpt-4o-mini")
+    prompt = _glossary_prompt(article["title"], paragraphs, max(1, int(glossary_cfg["max_terms"])))
+    raw_terms: Any = []
+    for attempt in range(int(glossary_cfg["max_retries"]) + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": "Return JSON only."}, {"role": "user", "content": prompt}],
+                max_tokens=int(glossary_cfg["max_tokens"]),
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            raw_terms = _extract_json_payload(response.choices[0].message.content or "").get("terms", [])
+            break
+        except Exception as exc:
+            log_.warning(f"关键词解析失败 (attempt {attempt + 1}): {exc}")
+            if not _should_retry_llm_error(exc, attempt, int(glossary_cfg["max_retries"])):
+                break
+    return _apply_glossary_terms(article, raw_terms, complete=True, max_terms=int(glossary_cfg["max_terms"]))
 
 
 def _compile_article_prompt(
     title: str,
     section: str,
     paragraphs: list[dict[str, str]],
+    glossary_enabled: bool,
+    glossary_max_terms: int,
 ) -> str:
     paragraph_lines = []
     for index, paragraph in enumerate(paragraphs, start=1):
@@ -1736,6 +1872,7 @@ Rules:
 - If a paragraph is a subheading/crosshead, translate it as a short Chinese heading.
 - For proper nouns that need context, retain the English original at first mention in parentheses so they can be annotated later.
 - Return JSON only. No Markdown fences, no explanations, no extra text.
+{f'''- Also return at most {glossary_max_terms} genuinely useful proper terms in glossary_terms. A term's surface must remain exactly visible in the specified Chinese paragraph. Use only: person, organization, company, policy_law, event, place_context, work, proper_concept, acronym. Each description_zh must contain 60-100 Chinese characters and must not invent facts.''' if glossary_enabled else ''}
 
 Title: {title}
 Section: {section}
@@ -1751,6 +1888,15 @@ Return JSON in this shape:
     {{
       "zh_text": "中文翻译",
       "role": "body"
+    }}
+  ],
+  "glossary_terms": [
+    {{
+      "term": "English proper term",
+      "term_zh": "中文名称",
+      "type": "organization",
+      "description_zh": "60-100字中文背景说明",
+      "occurrences": [{{"paragraph_index": 1, "surface": "中文段落中保留的英文原词", "occurrence": 1}}]
     }}
   ]
 }}
@@ -1787,7 +1933,7 @@ def compile_article_record(
             "content_markdown": "",
             "paragraphs": [],
             "images": images,
-            "image_insights": analyze_article_images(client, cfg, issue_date, title, images, log_),
+            "image_insights": [],
             "glossary_entries": [],
             "term_annotations": [],
             "glossary_analysis_complete": False,
@@ -1797,7 +1943,14 @@ def compile_article_record(
         }
         return article
 
-    prompt = _compile_article_prompt(title=title, section=section, paragraphs=source_paragraphs)
+    glossary_cfg = cfg["glossary"]
+    prompt = _compile_article_prompt(
+        title=title,
+        section=section,
+        paragraphs=source_paragraphs,
+        glossary_enabled=bool(glossary_cfg.get("enabled")),
+        glossary_max_terms=max(1, int(glossary_cfg.get("max_terms", 12))),
+    )
     llm = cfg["llm"]
     max_tokens = max(int(llm.get("max_tokens", 2048)), 4096)
 
@@ -1845,14 +1998,23 @@ def compile_article_record(
                 "content_markdown": _format_source_content_markdown(source_paragraphs),
                 "paragraphs": compiled_paragraphs,
                 "images": images or [],
-                "image_insights": analyze_article_images(client, cfg, issue_date, title, images or [], log_),
+                "image_insights": [],
                 "compiled_article": True,
                 "compile_status": "complete",
             }
-            return enrich_article_glossary(client, cfg, article, log_)
+            if glossary_cfg.get("enabled"):
+                return _apply_glossary_terms(
+                    article,
+                    payload.get("glossary_terms") or payload.get("terms"),
+                    complete=True,
+                    max_terms=int(glossary_cfg["max_terms"]),
+                )
+            return _apply_glossary_terms(article, [], complete=False)
         except Exception as exc:
             last_error = exc
             log_.warning(f"结构化编译失败 (attempt {attempt + 1}): {exc}")
+            if not _should_retry_llm_error(exc, attempt, int(cfg["crawl"].get("max_retries", 2))):
+                break
             time.sleep(1.0)
 
     log_.warning(f"结构化编译失败,回退到仅摘要模式: {title} ({last_error})")
@@ -1878,7 +2040,7 @@ def compile_article_record(
         "content_markdown": _format_source_content_markdown(source_paragraphs),
         "paragraphs": fallback_paragraphs,
         "images": images or [],
-        "image_insights": analyze_article_images(client, cfg, issue_date, title, images or [], log_),
+        "image_insights": [],
         "compiled_article": False,
         "compile_status": "fallback",
     }
@@ -1956,6 +2118,26 @@ def _next_seq(articles: list[dict[str, Any]], issue_date: str) -> int:
     return (max(used) + 1) if used else 1
 
 
+def _compile_article_task(cfg: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
+    """在线程中建立独立 LLM client，避免共享 HTTP client 的并发状态。"""
+    return compile_article_record(
+        make_llm_client(cfg),
+        cfg,
+        issue_date=payload["issue_date"],
+        section=payload["section"],
+        title=payload["title"],
+        url=payload["url"],
+        body=payload["body"],
+        article_id=payload["article_id"],
+        log_=log,
+        images=payload["images"],
+    )
+
+
+def _analyze_article_images_task(cfg: dict[str, Any], issue_date: str, title: str, images: list[str]) -> list[dict[str, Any]]:
+    return analyze_article_images(make_llm_client(cfg), cfg, issue_date, title, images, log)
+
+
 def process_issue(
     cfg: dict[str, Any],
     issue_date: str,
@@ -1966,10 +2148,14 @@ def process_issue(
     no_feishu: bool = False,
     debug_html_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """抓一个 issue,返回新增/重写的文章列表。"""
+    """抓一个 issue。浏览器串行，正文编译和图片解析由独立 LLM 队列并发完成。"""
     browser_cfg = cfg["browser"]
     delay_min = float(cfg["crawl"].get("delay_min_s", 5))
     delay_max = float(cfg["crawl"].get("delay_max_s", 10))
+    pipeline = cfg["pipeline"]
+    compile_workers = max(1, int(pipeline.get("compile_workers", 2)))
+    image_workers = max(1, int(pipeline.get("image_workers", 1)))
+    max_pending = max(compile_workers, int(pipeline.get("max_pending", compile_workers * 2)))
 
     log.info(f"启动浏览器 (user_data={browser_cfg['user_data_path']})")
     page = open_browser(browser_cfg["user_data_path"], bool(browser_cfg.get("headless", False)))
@@ -1987,87 +2173,147 @@ def process_issue(
                 print(f"[DRY] {c['issue_date']}  {c['section']:25s}  {c['title']}  {c['url']}")
             return []
 
+        cover_url = next((str(item.get("cover_image_url") or "") for item in candidates if item.get("cover_image_url")), "")
+        cover_image = materialize_issue_cover(cover_url, cfg, issue_date)
+
         existing = read_database_js()
         existing_by_url = {a["url"]: a for a in existing}
         if rewrite_id:
             existing = [a for a in existing if a.get("id") != rewrite_id]
             existing_by_url = {a["url"]: a for a in existing}
 
-        client = make_llm_client(cfg)
         new_articles: list[dict[str, Any]] = []
-        # existing 是可变 list,每收录一篇就 append,write_database_js 拿最新 list 写盘
         seq = _next_seq(existing, issue_date)
         log.info(
             f"开始逐篇抓取(已存在 {len(existing_by_url)} 篇,本 issue 可抓取 {len(candidates)} 条"
-            f"{f', 本 run 最多新增 {limit} 篇' if limit > 0 else ''})"
+            f"{f', 本 run 最多新增 {limit} 篇' if limit > 0 else ''}; "
+            f"正文 LLM {compile_workers} 路, 图片 LLM {image_workers} 路)"
         )
 
-        for cand in candidates:
-            if limit > 0 and len(new_articles) >= limit:
-                log.info(f"已达到本 run 限制 {limit} 篇,停止继续抓取")
-                break
-            url = cand["url"]
-            if url in existing_by_url and not rewrite_id:
-                log.info(f"⏭ 已存在,跳过: {cand['title'][:50]}  ({url[:60]}…)")
-                continue
+        with ThreadPoolExecutor(max_workers=compile_workers, thread_name_prefix="econ-compile") as compile_pool, \
+                ThreadPoolExecutor(max_workers=image_workers, thread_name_prefix="econ-image") as image_pool:
+            pending_compile: dict[Future, dict[str, Any]] = {}
+            pending_images: dict[Future, dict[str, Any]] = {}
 
-            log.info(f"抓取正文: {cand['title'][:60]}")
-            try:
-                title, body, image_urls = fetch_article_content(page, url)
-            except Exception as e:
-                log.warning(f"抓取失败 {url}: {e}")
-                time.sleep(random.uniform(delay_min, delay_max))
-                continue
-            if not body.strip() and not image_urls:
-                log.warning(f"未提取到正文或图片，丢弃: {url}")
-                time.sleep(random.uniform(delay_min, delay_max))
-                continue
-
-            title = title or cand["title"]
-            article_id = f"art_{issue_date}_{seq:03d}"
-            images = materialize_article_images(image_urls, cfg, issue_date, article_id)
-            article = compile_article_record(
-                client,
-                cfg,
-                issue_date=issue_date,
-                section=cand["section"],
-                title=title,
-                url=url,
-                body=body,
-                article_id=article_id,
-                log_=log,
-                images=images,
-            )
-            if not article:
-                time.sleep(random.uniform(delay_min, delay_max))
-                continue
-            # 立即落盘:用户刷新 index.html 就能看到刚抓的那篇
-            existing.append(article)
-            existing_by_url[url] = article
-            new_articles.append(article)
-            seq += 1
-            try:
-                write_database_js(existing)
+            def persist_article(article: dict[str, Any]) -> None:
+                existing.append(article)
+                existing_by_url[article["url"]] = article
+                new_articles.append(article)
                 try:
-                    _sync_paper_outputs(cfg, existing, issue_date=issue_date)
-                except Exception as sync_exc:
-                    log.warning(f"paper 输出同步失败(不影响旧 database.js): {sync_exc}")
-                log.info(
-                    f"✓ 已收录并落盘: {article['id']} - {title[:60]}  "
-                    f"(本 run 第 {len(new_articles)} 篇 / 累计 {len(existing)} 篇)"
+                    write_database_js(existing)
+                    log.info(
+                        f"✓ 已收录并落盘: {article['id']} - {article['title'][:60]}  "
+                        f"(本 run 第 {len(new_articles)} 篇 / 累计 {len(existing)} 篇)"
+                    )
+                    _maybe_export_article_md(cfg, article)
+                    if cfg["image_analysis"].get("enabled") and article.get("images"):
+                        future = image_pool.submit(
+                            _analyze_article_images_task,
+                            cfg,
+                            issue_date,
+                            str(article.get("title") or ""),
+                            list(article["images"]),
+                        )
+                        pending_images[future] = article
+                except Exception as exc:
+                    log.error(f"写盘失败 {article.get('url')}:{exc},该篇未持久化")
+                    existing.pop()
+                    existing_by_url.pop(article.get("url"), None)
+                    new_articles.pop()
+
+            def drain_compiled(block: bool) -> None:
+                if not pending_compile:
+                    return
+                done, _ = wait(
+                    pending_compile,
+                    timeout=None if block else 0,
+                    return_when=FIRST_COMPLETED,
                 )
-                # 每篇落盘后顺便重建 index.html(自包含版),用户双击就能看
-                _maybe_rebuild_index(cfg)
-                # 每篇落盘后顺手导出 .md(如 .env 配置了 ARTICLE_MD_DIR)
-                _maybe_export_article_md(cfg, article)
-            except Exception as e:
-                log.error(f"写盘失败 {url}:{e},该篇未持久化,下轮会重试")
-                # 回滚内存里的累计,避免误以为已落盘
-                existing.pop()
-                existing_by_url.pop(url, None)
-                new_articles.pop()
-                seq -= 1
-            time.sleep(random.uniform(delay_min, delay_max))
+                for future in done:
+                    payload = pending_compile.pop(future)
+                    try:
+                        article = future.result()
+                    except Exception as exc:
+                        log.warning(f"结构化编译任务失败 {payload['url']}: {exc}")
+                        continue
+                    if article:
+                        persist_article(article)
+
+            def drain_images(block: bool) -> None:
+                if not pending_images:
+                    return
+                done, _ = wait(
+                    pending_images,
+                    timeout=None if block else 0,
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in done:
+                    article = pending_images.pop(future)
+                    try:
+                        article["image_insights"] = future.result()
+                        write_database_js(existing)
+                        log.info(
+                            f"[images] 已解析 {article['id']}: "
+                            f"{len(article.get('image_insights') or [])} 条图片说明"
+                        )
+                    except Exception as exc:
+                        log.warning(f"图片解析任务失败 {article.get('url')}: {exc}")
+
+            for cand in candidates:
+                drain_compiled(block=False)
+                drain_images(block=False)
+                while limit > 0 and len(new_articles) + len(pending_compile) >= limit:
+                    drain_compiled(block=True)
+                    if len(new_articles) >= limit:
+                        break
+                if limit > 0 and len(new_articles) >= limit:
+                    log.info(f"已达到本 run 限制 {limit} 篇,停止继续抓取")
+                    break
+                while len(pending_compile) >= max_pending:
+                    drain_compiled(block=True)
+
+                url = cand["url"]
+                if url in existing_by_url:
+                    log.info(f"⏭ 已存在,跳过: {cand['title'][:50]}  ({url[:60]}…)")
+                    continue
+                log.info(f"抓取正文: {cand['title'][:60]}")
+                try:
+                    title, body, image_urls = fetch_article_content(page, url)
+                except Exception as exc:
+                    log.warning(f"抓取失败 {url}: {exc}")
+                    time.sleep(random.uniform(delay_min, delay_max))
+                    continue
+                if not body.strip() and not image_urls:
+                    log.warning(f"未提取到正文或图片，丢弃: {url}")
+                    time.sleep(random.uniform(delay_min, delay_max))
+                    continue
+
+                title = title or cand["title"]
+                article_id = f"art_{issue_date}_{seq:03d}"
+                seq += 1
+                payload = {
+                    "issue_date": issue_date,
+                    "section": cand["section"],
+                    "title": title,
+                    "url": url,
+                    "body": body,
+                    "article_id": article_id,
+                    "images": materialize_article_images(image_urls, cfg, issue_date, article_id),
+                }
+                pending_compile[compile_pool.submit(_compile_article_task, cfg, payload)] = payload
+                time.sleep(random.uniform(delay_min, delay_max))
+
+            while pending_compile:
+                drain_compiled(block=True)
+                drain_images(block=False)
+            while pending_images:
+                drain_images(block=True)
+
+        try:
+            _sync_paper_outputs(cfg, existing, issue_date=issue_date, issue_covers={issue_date: cover_image})
+            _maybe_rebuild_index(cfg)
+        except Exception as sync_exc:
+            log.warning(f"paper 输出同步失败(不影响旧 database.js): {sync_exc}")
 
         log.info(f"=== 本 run 完成,新增 {len(new_articles)} 篇,database.js 累计 {len(existing)} 篇 ===")
         if new_articles and not no_feishu:
@@ -2374,6 +2620,10 @@ def process_single_url(
             return []
 
         article = compiled
+        if cfg["image_analysis"].get("enabled") and article.get("images"):
+            article["image_insights"] = analyze_article_images(
+                client, cfg, article["issue_date"], article["title"], article["images"], log
+            )
         write_database_js(existing_after + [article])
         log.info(f"[single-url] ✓ 已写入: {article['id']} - {article['title']}")
         try:

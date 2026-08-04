@@ -1207,6 +1207,32 @@
 
     let currentUtterance = null;
 
+    function selectVoice(lang) {
+        const voices = window.speechSynthesis.getVoices();
+        if (!voices.length) return null;
+        const isEnglish = lang.toLowerCase().startsWith('en');
+        const preferredNames = isEnglish
+            ? ['daniel', 'oliver', 'samantha', 'karen', 'google uk english', 'google us english']
+            : [];
+        const scored = voices.map(voice => {
+            const voiceLang = String(voice.lang || '').toLowerCase();
+            const voiceName = String(voice.name || '').toLowerCase();
+            let score = 0;
+            if (isEnglish) {
+                if (!voiceLang.startsWith('en')) return { voice, score: -1000 };
+                score += voiceLang.startsWith('en-gb') ? 120 : 80;
+                if (preferredNames.some(name => voiceName.includes(name))) score += 30;
+                if (voice.localService) score += 5;
+            } else if (voiceLang.startsWith('zh')) {
+                score += voiceLang.startsWith('zh-cn') ? 120 : 80;
+            } else {
+                score = -1000;
+            }
+            return { voice, score };
+        }).sort((left, right) => right.score - left.score);
+        return scored[0] && scored[0].score > -1000 ? scored[0].voice : null;
+    }
+
     function setupTtsButtons() {
         bindTts('tts-summary', () => document.getElementById('summary-content').textContent, 'zh-CN');
         bindTts('tts-bilingual-zh', () => collectBilingualText('zh'), 'zh-CN');
@@ -1227,7 +1253,9 @@
             if (!text) return;
             currentUtterance = new SpeechSynthesisUtterance(text.slice(0, 18000));
             currentUtterance.lang = lang;
-            currentUtterance.rate = lang.startsWith('zh') ? 0.95 : 1.0;
+            const voice = selectVoice(lang);
+            if (voice) currentUtterance.voice = voice;
+            currentUtterance.rate = lang.startsWith('zh') ? 0.95 : 0.92;
             currentUtterance.onend = stopTts;
             currentUtterance.onerror = stopTts;
             button.classList.add('is-playing');
@@ -1249,6 +1277,11 @@
                 : label.textContent.includes('英文') ? '朗读英文'
                 : '朗读';
         });
+    }
+
+    if ('speechSynthesis' in window) {
+        window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+        window.speechSynthesis.getVoices();
     }
 
     function collectBilingualText(lang) {
