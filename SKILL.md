@@ -1,102 +1,112 @@
 ---
 name: economist-weekly-archiver
 description: |
-  自动抓取《经济学人》周刊当前或指定期的所有允许板块文章,生成中文深度摘要,持久化到本地 database.js,
-  并可选推送到飞书机器人。零后端、零依赖前端(双击 index.html 即用)。
+  抓取《经济学人》weekly edition 当前或指定期的全部文章，使用 .env 中配置的
+  OpenAI-compatible LLM 生成中文解读、段落翻译、关键词解析和图片简析，下载正文图片，
+  持久化到 database.js，并可选推送到 Feishu。支持 --limit 做小批量预览。
 
-  触发场景:用户想抓《经济学人》某期 / 某篇文章、补抓漏网文章、把已抓取的文章导给飞书群。
+  触发场景：用户想抓取《经济学人》某一期、补抓单篇文章、刷新已有文章图片，或导入本地 Cookie。
 ---
 
 # Economist Weekly Archiver Skill
 
-每周四早上《经济学人》新刊上线后,跑一次本 skill 把当期内容入库;离线浏览 + 搜索 + 飞书通知一条龙。
+这是一个本地运行的《经济学人》周刊归档工具。它复用已登录的 Chrome profile，访问
+`weeklyedition` 目录，筛选出实际文章链接后逐篇抓取正文和图片，调用 `.env` 中的 LLM
+生成中文内容，最后写入 `database.js` 供 `index.html` 离线浏览。
 
-## 何时使用
+## 使用范围
 
-- 想把《经济学人》新一期的非政治/非商业板块(科技、文化、书评、讣告、图表、长文 briefing)自动入库到本地
-- 想补抓 weekly edition 目录里漏掉或抓失败的某一篇
-- 已在别的浏览器登录了《经济学人》、但本机拿不到验证码,想把 cookie 灌过来
-- 想要离线可搜索、可对照原文的个人知识库
-- **想分享给朋友看**:`./deploy_to_netlify.sh` 一键部署,朋友只需要 URL 就能浏览自包含 SPA
-
-**不要用本 skill 做的事**:
-- 抓取 politics / business / finance / united-states / china / asia / europe 等板块 — 已被板块白名单过滤掉
-- 商业分发抓到的内容 — 违反版权
-- 把 `database.js` 推到公网仓库 — 含付费原文
+- 默认全量抓取 weekly edition 返回的文章，不再使用 `ALLOW_SECTIONS` 板块白名单。
+- 只排除明确的非文章路径，例如 `/topic/`、`/person/`、`/newsletters/`、`/audio/`、`/video/`。
+- 不再因为正文过短跳过文章；卡通漫画等短内容也会保留，并抓取页面中的漫画图片。
+- `--limit N` 只限制本次最多新增的文章数，适合先抓 3 篇验证；不改变全量候选列表。
+- 文章和图片仅用于个人阅读和研究。Economist 内容受版权及服务条款保护，不应公开分发。
 
 ## 快速调用
 
 ```bash
-# 首次:装依赖 + 配 .env + 手动登录(只跑一次)
 pip install -r requirements.txt
-cp .env.example .env        # 填 LLM_API_KEY 和 FEISHU_WEBHOOK_URL
-# 然后跑一次性脚本手动登录(详见 README.md 第 3 步)
+cp .env.example .env
+# 在 .env 填写 LLM_API_KEY，并确保 Chrome profile 已登录 Economist
 
-# 抓最新一期 + 推飞书
-python sync_weekly.py
+# 先抓 3 篇预览
+python sync_weekly.py --issue 2026-08-01 --limit 3 --no-feishu
 
-# 抓指定周六一期(2026-06-27 是周六)
-python sync_weekly.py --issue 2026-06-27
+# 需要时再抓本期剩余文章
+python sync_weekly.py --issue 2026-08-01 --no-feishu
 
-# 只列链接不抓正文
-python sync_weekly.py --dry-run
-
-# 抓单篇调试
-python sync_weekly.py --single-url https://www.economist.com/briefing/.../... --section Briefing
-
-# 从 JSON 文件灌 cookie 到 Chrome profile
-python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
+# 重新抓取已有文章图片并生成图片简析
+python sync_weekly.py --issue 2026-08-01 --refresh-images \
+  --article-ids art_2026-08-01_007,art_2026-08-01_008 --no-feishu
 ```
 
-完整文档见 [README.md](./README.md)。
+## 输入与输出
 
-## 输入 / 输出
+输入包括 `.env`、已登录的 Chrome profile，以及可选的本地 Cookie 文件。默认输出为：
 
-| | |
-|---|---|
-| **输入** | `.env`(所有凭据 / 路径 / 调优参数);`sync_weekly.py` 内的 `DEFAULTS` dict 提供结构化兜底;Chrome profile 已登录状态 |
-| **输出** | `database.js`(每抓一篇追加);可选 `{ARTICLE_MD_DIR}/{issue_date}/{slug}-{id}.md`(按期分目录、标题 slug + id 命名);可选 `INDEX_HTML_PATH`(自包含 index.html,数据库内联);`logs/sync_YYYYMMDD.log`;可选飞书卡片 |
-| **运行时长** | 47 篇 × 5-10s 间隔 ≈ 4-8 分钟抓正文,加 LLM 调用整体 10-30 分钟 |
+- `database.js`：归档文章数据，逐篇写盘并按 URL 去重。
+- `output_results/TE/{issue_date}/images/`：下载后的正文图片。
+- `logs/sync_YYYYMMDD.log`：运行日志。
+- 可选 `ARTICLE_MD_DIR`：按期导出的英文 Markdown 原文。
+- 可选 `INDEX_HTML_PATH`：数据库内联后的自包含浏览页面。
 
-## 产物构件(可独立启用)
+图片只取文章主体和明确的 `leadComponent`/`leadImage` 等字段，并限制在页面
+`Explore more` 之前；`weeklyEdition.cover`、`squareCover` 等周刊封面不会作为正文图片保存。
+每张图片可生成 50-80 个中文字符的 `image_insights`，说明图片、图表或漫画内容及其与文章的关系。
 
-每篇抓完后,根据 `.env` 配置,可同时产生最多三件互不依赖的产物:
+每篇文章还可以产生：
 
-| 产物 | 触发 env 变量 | 内容 | 默认 |
-|------|------|------|------|
-| `database.js` | `DATABASE_JS_PATH` | 全量 JSON 数组,供 index.html 加载 | 项目根 `database.js` |
-| `art_<id>.md` | `ARTICLE_MD_DIR` | 每篇英文原文,**零包装**(纯 `content_raw.strip()`);按 `issue_date` 分目录,文件名为 `{标题 slug}-{id}.md` | 关闭,需手动配 |
-| `index.html`(自包含) | `INDEX_HTML_PATH` | 数据库内联进 HTML 模板,可双击即用 | 关闭,需手动配 |
+- `summary_md`：约 400-500 个中文字符的连贯中文解读。
+- `paragraphs`：按原文段落保存英文和中文内容。
+- `glossary_entries`：关键词、中文名称、类型和中文背景说明。
+- `term_annotations`：关键词在中文段落中的定位信息。
+- `glossary_analysis_complete`、`glossary_version`：关键词解析状态和版本。
 
-## 核心不变量
+## CLI
 
-- `database.js` 必须以 `window.economist_db = [` 开头、`];` 结尾,供 `index.html` 直接当 JS 加载
-- 同一 `url` 全局去重,按 `(issue_date DESC, id ASC)` 排序
-- 文章字段:`issue_date` / `id`(`art_<date>_NNN`) / `section` / `title` / `url` / `summary_md`(≥300 中文字)/ `content_raw`(≥1000 字符)
-- 每周六才发布,非周六日期 `--issue` 直接拒绝
-- LLM 摘要里若混入英文思考链,自动从 `🌟 一句话核心主旨` 开始截取
-
-## 完全自动化(Mac)
-
-`launchd/com.economist.archiver.weekly.plist` 提供 macOS launchd 一键调度配置(每周五 20:00 触发 `run_weekly_sync.sh`):
-
-```bash
-cp launchd/com.economist.archiver.weekly.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.economist.archiver.weekly.plist
-# 立即手动触发验证
-launchctl start com.economist.archiver.weekly
-# 看日志
-tail -f /tmp/economist-archiver-launchd.out.log
+```text
+--issue YYYY-MM-DD       抓指定周六期；省略则抓最新一期
+--limit N                本次最多新增 N 篇，0 表示不限制
+--dry-run                只列出候选链接，不抓正文、不写库
+--no-feishu              不推送 Feishu
+--refresh-images         只刷新已有文章图片和图片简析
+--article-ids IDS        配合 --refresh-images，逗号分隔 article id
+--single-url URL         只抓指定 URL 一篇
+--section NAME           配合 --single-url 指定板块
+--rewrite-id ID          强制重写指定文章
+--import-cookies FILE    导入本地 JSON 或 Netscape Cookie 文件
+--debug-html DIR         保存 weeklyedition HTML 供排错
+--kill-stale             清理残留 Chrome 进程和锁文件
+--rebuild-index          只根据 database.js 重建 index.html
 ```
 
-完全自动化流程:launchd 触发 → `run_weekly_sync.sh`(抓取 + copy + `git push`) → GitHub → Netlify 自动 redeploy → 朋友看到最新内容。配置一次后**完全不动手**。
+## LLM 配置
 
-## 安全红线
+所有 LLM 调用都读取 `.env` 的配置，不使用 Codex 模型。默认的文章解读、关键词解析和图片解析
+共用 `LLM_API_KEY` 与 `LLM_BASE_URL`；各功能可单独指定模型：
 
-- `database.js` 和 `{ARTICLE_MD_DIR}/art_*.md` 都含付费原文,**禁止推到公网仓库**(用户应自行在 `.gitignore` 加入对应的目录模式)
-- 所有真实配置只放 `.env`(API Key、Webhook、Base URL、路径、调优参数),已加 `.gitignore`,**禁止入库**
-- **Cookie 永远不要发到任何 AI 对话 / 工单 / 公开频道** — 本地 `--import-cookies` 走,全程不出本机
+```dotenv
+LLM_API_KEY=sk-...
+LLM_BASE_URL=https://api.example.com/v1
+LLM_MODEL=gpt-4o-mini
+LLM_GLOSSARY_ENABLED=true
+LLM_GLOSSARY_MODEL=
+OPENAI_VISION_MODEL=
+LLM_ANALYZE_ARTICLE_IMAGES=true
+```
+
+完整配置项和默认值见 `.env.example` 与 `README.md`。
+
+## 安全要求
+
+- 不要提交 `.env`、Cookie、`database.js`、`output_results/` 或含付费原文的导出目录。
+- `economist_cookies.json` 是登录凭据，不要发送到聊天、工单或公开仓库。
+- 本项目当前只完成代码、静态检查和本地运行验证；仓库中已删除测试代码，不要在文档中声称有测试数量。
+
+## 参考
+
+完整安装、配置和数据字段说明见 [README.md](README.md)。
 
 ## 许可
 
-本 skill 代码:MIT。《经济学人》内容版权归 Economist Newspaper Ltd 所有。
+本 skill 代码采用 MIT。Economist 内容版权归 Economist Newspaper Ltd 所有。

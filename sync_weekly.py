@@ -20,6 +20,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 # 延迟导入 requests/openai,方便无 LLM 依赖环境下跑单元测试。
 # 真正调用 LLM / 推飞书时才触发。
@@ -28,32 +29,18 @@ from typing import Any
 # 常量(详见 DEVELOPMENT.md §3.2.3 / §3.2.4)
 # ---------------------------------------------------------------------------
 
-ALLOW_SECTIONS: set[str] = {
-    "Science & technology",
-    "Culture",
-    "Books & arts",
-    "Obituary",
-    "Graphic detail",
-    "Briefing",
-    "Britain",
-    "Europe",
-    "United States",
-    "Middle East & Africa",
-    "The Americas",
-    "Asia",
-    "International",
-    "1843"
+NON_ARTICLE_PATH_KEYWORDS: tuple[str, ...] = (
+    "/topic/", "/person/", "/newsletters/", "/audio/", "/video/",
+)
+GLOSSARY_VERSION = 1
+GLOSSARY_TYPES = {
+    "person", "organization", "company", "policy_law", "event",
+    "place_context", "work", "proper_concept", "acronym",
 }
 
-DENY_PATH_KEYWORDS: tuple[str, ...] = (
-    "/politics/", "/business/", "/finance-and-economics/",
-    "/united-states/", "/china/", "/asia/", "/middle-east/",
-    "/europe/", "/americas/", "/africa/", "/britain/",
-    "/leaders/", "/letters/", "/by-invitation/",
-    "/lexington/", "/banyan/", "/charlie-/", "/schumpeter/",
-)
-
 WEEKLY_URL = "https://www.economist.com/weeklyedition"
+PAPER_PUBLICATION_TYPE = "TE"
+PAPER_PUBLICATION_NAME = "The Economist"
 
 
 def validate_issue_date(issue_date: str) -> tuple[bool, str]:
@@ -118,7 +105,6 @@ LOGS_DIR = ROOT / "logs"
 
 CN_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
 MIN_CN_CHARS = 300
-MIN_EN_CHARS = 1000
 
 # ---------------------------------------------------------------------------
 # 默认配置(全部从 .env 覆盖,默认值在这里 hardcode)
@@ -148,7 +134,22 @@ DEFAULTS = {
         "delay_max_s": 10,
         "max_retries": 2,
     },
+    "glossary": {
+        "enabled": True,
+        "model": "",
+        "max_terms": 12,
+        "max_tokens": 5000,
+        "max_retries": 2,
+    },
+    "image_analysis": {
+        "enabled": True,
+        "model": "",
+        "max_tokens": 2400,
+        "max_retries": 2,
+        "max_images": 6,
+    },
     "paths": {
+        "output_root": "",
         "database_js": "",   # 空 = 用全局 DATABASE_JS(项目根/database.js)
         "index_html": "",    # 空 = 不生成自包含 index.html(只用项目根的)
         "index_template": "",  # 空 = 用项目根/index.html 当模板
@@ -223,7 +224,22 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
         "crawl.delay_min_s": src.get("CRAWL_DELAY_MIN_S", "").strip(),
         "crawl.delay_max_s": src.get("CRAWL_DELAY_MAX_S", "").strip(),
         "crawl.max_retries": src.get("CRAWL_MAX_RETRIES", "").strip(),
+        "glossary.model": (
+            src.get("LLM_GLOSSARY_MODEL", "").strip()
+            or src.get("OPENAI_GLOSSARY_MODEL", "").strip()
+        ),
+        "glossary.max_terms": src.get("LLM_GLOSSARY_MAX_TERMS", "").strip(),
+        "glossary.max_tokens": src.get("LLM_GLOSSARY_MAX_TOKENS", "").strip(),
+        "glossary.max_retries": src.get("LLM_GLOSSARY_MAX_RETRIES", "").strip(),
+        "image_analysis.model": (
+            src.get("OPENAI_VISION_MODEL", "").strip()
+            or src.get("LLM_IMAGE_ANALYSIS_MODEL", "").strip()
+        ),
+        "image_analysis.max_tokens": src.get("LLM_IMAGE_ANALYSIS_MAX_TOKENS", "").strip(),
+        "image_analysis.max_retries": src.get("LLM_IMAGE_ANALYSIS_MAX_RETRIES", "").strip(),
+        "image_analysis.max_images": src.get("LLM_MAX_IMAGES_PER_ARTICLE", "").strip(),
         "paths.database_js": src.get("DATABASE_JS_PATH", "").strip(),
+        "paths.output_root": src.get("OUTPUT_ROOT", "").strip(),
         "paths.index_html": src.get("INDEX_HTML_PATH", "").strip(),
         "paths.index_template": src.get("INDEX_HTML_TEMPLATE", "").strip(),
         "paths.article_md_dir": src.get("ARTICLE_MD_DIR", "").strip(),
@@ -238,6 +254,8 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
     int_fields = {
         "llm": ["max_tokens", "timeout_s"],
         "crawl": ["delay_min_s", "delay_max_s", "max_retries"],
+        "glossary": ["max_terms", "max_tokens", "max_retries"],
+        "image_analysis": ["max_tokens", "max_retries", "max_images"],
     }
     for section, keys in int_fields.items():
         for k in keys:
@@ -251,6 +269,18 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
         cfg["llm"]["temperature"] = float(raw)
     except (ValueError, TypeError):
         cfg["llm"]["temperature"] = DEFAULTS["llm"]["temperature"]
+
+    raw_glossary_enabled = src.get("LLM_GLOSSARY_ENABLED", "").strip().lower()
+    if raw_glossary_enabled:
+        cfg["glossary"]["enabled"] = raw_glossary_enabled in ("1", "true", "yes", "on")
+    raw_image_analysis_enabled = src.get("LLM_ANALYZE_ARTICLE_IMAGES", "").strip().lower()
+    if raw_image_analysis_enabled:
+        cfg["image_analysis"]["enabled"] = raw_image_analysis_enabled in ("1", "true", "yes", "on")
+
+    paths = cfg.get("paths") or {}
+    if not str(paths.get("output_root") or "").strip():
+        paths["output_root"] = str(ROOT / "output_results")
+    cfg["paths"] = paths
 
     return cfg
 
@@ -327,6 +357,202 @@ def write_database_js(articles: list[dict[str, Any]], path: Path | None = None) 
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
+
+
+def _paper_output_root(cfg: dict[str, Any]) -> Path:
+    paths = cfg.get("paths") or {}
+    out = str(paths.get("output_root") or "").strip()
+    return Path(out) if out else (ROOT / "output_results")
+
+
+def _group_articles_by_issue(articles: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for article in articles:
+        issue_date = str(article.get("issue_date") or "").strip()
+        if not issue_date:
+            continue
+        grouped.setdefault(issue_date, []).append(article)
+    for issue_date, issue_articles in grouped.items():
+        issue_articles.sort(key=lambda a: str(a.get("id") or ""))
+    return dict(sorted(grouped.items(), key=lambda item: item[0], reverse=True))
+
+
+def _normalise_paper_article(article: dict[str, Any], index: int) -> dict[str, Any]:
+    article_id = str(article.get("id") or f"art_{index:03d}")
+    source_paragraphs = article.get("paragraphs") if isinstance(article.get("paragraphs"), list) else []
+    normalized_paragraphs: list[dict[str, Any]] = []
+    for para_index, paragraph in enumerate(source_paragraphs, start=1):
+        if not isinstance(paragraph, dict):
+            continue
+        en_text = str(paragraph.get("en_text") or paragraph.get("en_html") or "").strip()
+        zh_text = str(paragraph.get("zh_text") or "").strip()
+        role = str(paragraph.get("role") or "body").strip() or "body"
+        if not en_text and not zh_text:
+            continue
+        normalized_paragraphs.append(
+            {
+                "para_id": str(paragraph.get("para_id") or f"{article_id}_p{para_index}"),
+                "en_text": en_text,
+                "zh_text": zh_text,
+                "role": role,
+            }
+        )
+
+    if not normalized_paragraphs:
+        normalized_paragraphs = [
+            {
+                "para_id": f"{article_id}_p1",
+                "en_text": str(article.get("content_markdown") or article.get("content_raw") or "").strip(),
+                "zh_text": "",
+                "role": "body",
+            }
+        ]
+
+    content_markdown = str(article.get("content_markdown") or "").strip()
+    if not content_markdown:
+        content_markdown = "\n\n".join(
+            f"## {para['en_text']}" if para.get("role") == "crosshead" else para["en_text"]
+            for para in normalized_paragraphs
+            if str(para.get("en_text") or "").strip()
+        )
+
+    return {
+        "id": article_id,
+        "publication_type": PAPER_PUBLICATION_TYPE,
+        "publication_date": str(article.get("issue_date") or ""),
+        "source_pdf": "Economist Weekly",
+        "page": int(article.get("page") or 0) if str(article.get("page") or "").isdigit() else 0,
+        "page_article_index": int(article.get("page_article_index") or 0) if str(article.get("page_article_index") or "").isdigit() else index,
+        "category": str(article.get("section") or "General"),
+        "title": str(article.get("title") or ""),
+        "title_zh": str(article.get("title_zh") or ""),
+        "markdown_path": f"articles/{article_id}.md",
+        "summary_md": str(article.get("summary_md") or ""),
+        "compiled_article": bool(article.get("compiled_article")),
+        "compile_status": str(article.get("compile_status") or "pending"),
+        "content_markdown": content_markdown,
+        "content_raw": str(article.get("content_raw") or article.get("content_markdown") or "").strip(),
+        "paragraphs": normalized_paragraphs,
+        "images": article.get("images") or [],
+        "image_insights": article.get("image_insights") or [],
+        "term_annotations": article.get("term_annotations") or [],
+        "glossary_analysis_complete": bool(article.get("glossary_analysis_complete")),
+        "glossary_version": int(article.get("glossary_version") or 0),
+    }
+
+
+def _write_atomic_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        raise
+
+
+def _write_atomic_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def _build_issue_glossary(articles: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """把逐篇术语条目聚合为前端按 glossary_id 查询的期刊级字典。"""
+    glossary: dict[str, dict[str, Any]] = {}
+    for article in articles:
+        for entry in article.get("glossary_entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            glossary_id = str(entry.get("id") or "").strip()
+            if glossary_id:
+                glossary[glossary_id] = dict(entry)
+    return glossary
+
+
+def _write_paper_issue_database(
+    output_root: Path,
+    issue_date: str,
+    articles: list[dict[str, Any]],
+) -> tuple[Path, str, dict[str, Any]]:
+    issue_dir = output_root / PAPER_PUBLICATION_TYPE / issue_date
+    database_path = issue_dir / "database.js"
+    pdf_id = f"{PAPER_PUBLICATION_TYPE}_{issue_date}_economist-weekly"
+    normalized_articles = [
+        _normalise_paper_article(article, index)
+        for index, article in enumerate(articles, start=1)
+    ]
+    payload = {
+        "id": pdf_id,
+        "publication_type": PAPER_PUBLICATION_TYPE,
+        "publication_date": issue_date,
+        "original_filename": f"Economist Weekly - {issue_date}",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "cover_image": "",
+        "article_count": len(normalized_articles),
+        "glossary_version": GLOSSARY_VERSION,
+        "glossary": _build_issue_glossary(articles),
+        "articles": normalized_articles,
+    }
+    text = (
+        "window.paper_databases = window.paper_databases || {};\n"
+        f'window.paper_databases[{json.dumps(pdf_id, ensure_ascii=False)}] = '
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)};\n"
+    )
+    _write_atomic_text(database_path, text)
+    return database_path, pdf_id, payload
+
+
+def _write_paper_database_index(
+    output_root: Path,
+    grouped_articles: dict[str, list[dict[str, Any]]],
+) -> Path:
+    index_path = output_root / "database_index.js"
+    items: list[dict[str, Any]] = []
+    for issue_date, issue_articles in grouped_articles.items():
+        pdf_id = f"{PAPER_PUBLICATION_TYPE}_{issue_date}_economist-weekly"
+        items.append(
+            {
+                "id": pdf_id,
+                "publication_type": PAPER_PUBLICATION_TYPE,
+                "publication_date": issue_date,
+                "original_filename": f"Economist Weekly - {issue_date}",
+                "database_path": f"{PAPER_PUBLICATION_TYPE}/{issue_date}/database.js",
+                "cover_image": "",
+                "article_count": len(issue_articles),
+                "sections": sorted({str(article.get("section") or "General") for article in issue_articles}),
+                "titles": [article.get("title") for article in issue_articles if article.get("title")],
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+    text = "window.paper_db_index = " + json.dumps(items, ensure_ascii=False, indent=2) + ";\n"
+    _write_atomic_text(index_path, text)
+    return index_path
+
+
+def _sync_paper_outputs(
+    cfg: dict[str, Any],
+    articles: list[dict[str, Any]],
+    issue_date: str | None = None,
+) -> None:
+    output_root = _paper_output_root(cfg)
+    grouped = _group_articles_by_issue(articles)
+    for grouped_issue_date, issue_articles in grouped.items():
+        _write_paper_issue_database(output_root, grouped_issue_date, issue_articles)
+    _write_paper_database_index(output_root, grouped)
 
 
 def _date_key(s: str) -> int:
@@ -440,6 +666,29 @@ def _maybe_rebuild_index(cfg: dict[str, Any]) -> None:
         return
     if not db_path.exists():
         log.warning(f"[index] 数据库不存在 {db_path},跳过重建")
+        return
+    try:
+        template = template_path.read_text(encoding="utf-8")
+    except Exception as e:
+        log.warning(f"[index] 读模板失败 {template_path}:{e}")
+        return
+
+    if _INDEX_TEMPLATE_MARKER not in template:
+        try:
+            db_text = db_path.read_text(encoding="utf-8")
+            inline = (
+                "\n<script>\n"
+                "/* legacy inline database for compatibility */\n"
+                f"{db_text}\n"
+                "</script>\n"
+            )
+            rendered = template.replace("</body>", f"{inline}</body>")
+            if rendered == template:
+                rendered = template + inline
+            _write_atomic_text(output_path, rendered)
+            log.info(f"[index] ✓ 已复制模板并内联旧数据库到 {output_path}")
+        except Exception as e:
+            log.warning(f"[index] 复制模板失败(不影响抓取):{e}")
         return
 
     try:
@@ -567,18 +816,10 @@ def _maybe_export_article_md(cfg: dict[str, Any], article: dict[str, Any]) -> No
 
 
 def is_allowed_article(url: str, section: str) -> bool:
-    """板块白名单精准过滤。
-
-    不再在 URL 路径里去搜 "/britain/" 这种黑名单关键词，
-    而是严格根据《经济学人》页面上渲染出来的 Section 名字进行白名单卡放。
-    """
-    # 1. 基础链接去重防御（非文章类型直接干掉）
-    if any(kw in url for kw in ["/topic/", "/person/", "/newsletters/", "/audio/", "/video/"]):
-        return False
-
-    # 2. 严格遵循你给 AI 提的需求：除 politics 和 business 之外，只保留特定的严肃科技/文化知识板块
-    # 页面上抓到的 section 文本如果属于 ALLOW_SECTIONS，则直接放行
-    return section in ALLOW_SECTIONS
+    """保留 weeklyedition 中的所有文章，只排除确定不是文章的链接。"""
+    del section  # 板块不再参与过滤，Politics、Business 等均应抓取。
+    path = urlparse(url).path.lower()
+    return bool(path) and not any(keyword in path for keyword in NON_ARTICLE_PATH_KEYWORDS)
 
 
 # ---------------------------------------------------------------------------
@@ -798,8 +1039,65 @@ def _parse_weeklyedition_html_v2(html: str) -> list[dict[str, str]]:
     return out
 
 
-def fetch_article_content(page, url: str) -> tuple[str, str]:
-    """访问单篇文章，返回 (title, content_raw)。
+def _is_article_image_url(value: Any) -> bool:
+    if not isinstance(value, str) or not value.startswith(("https://", "http://")):
+        return False
+    parsed = urlparse(value)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if re.search(r"/\d{8}_wwp\d*\.(?:jpg|jpeg|png|webp)$", path):
+        return False
+    return (
+        host.endswith("images.economist.com")
+        or (host.endswith("economist.com") and "/img/" in path)
+        or (host.endswith("economist.com") and path.endswith((".jpg", ".jpeg", ".png", ".webp")))
+    )
+
+
+def _collect_article_image_urls(value: Any, output: list[str], seen: set[str]) -> None:
+    """从 Next.js 文章数据中提取 Economist CDN 图片 URL。"""
+    if isinstance(value, str):
+        if _is_article_image_url(value) and value not in seen:
+            seen.add(value)
+            output.append(value)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_article_image_urls(item, output, seen)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _collect_article_image_urls(item, output, seen)
+
+
+def _visible_article_image_urls(page) -> list[str]:
+    """只抓 Explore more 之前已渲染的正文和漫画图片。"""
+    try:
+        values = page.run_js(
+            """
+            (() => {
+              const marker = Array.from(document.querySelectorAll('h1,h2,h3,h4,p,span,a,div'))
+                .find(el => el.textContent.trim() === 'Explore more');
+              const beforeMarker = node => !marker || Boolean(
+                node.compareDocumentPosition(marker) & Node.DOCUMENT_POSITION_FOLLOWING
+              );
+              const imageUrls = Array.from(document.querySelectorAll('img'))
+                .filter(beforeMarker).map(img => img.currentSrc || img.src);
+              const backgroundUrls = Array.from(document.querySelectorAll('[style*="background-image"]'))
+                .filter(beforeMarker).map(node => getComputedStyle(node).backgroundImage)
+                .map(value => (value.match(/url\\(["']?(.*?)["']?\\)/) || [])[1]);
+              return imageUrls.concat(backgroundUrls).filter(Boolean);
+            })()
+            """
+        ) or []
+    except Exception as exc:
+        log.warning(f"图片 DOM 提取失败(不影响正文): {exc}")
+        return []
+    return [value for value in values if _is_article_image_url(value)]
+
+
+def fetch_article_content(page, url: str) -> tuple[str, str, list[str]]:
+    """访问单篇文章，返回 (title, content_raw, image_urls)。
 
     【核心修正版】：放弃不稳定的动态 DOM 抓取，全面转向提取并解析页面底部的 __NEXT_DATA__ JSON 块。
     100% 免疫前端改名、懒加载截断和动态闪烁，确保长文章全文无损恢复。
@@ -811,6 +1109,8 @@ def fetch_article_content(page, url: str) -> tuple[str, str]:
     html_source = page.html
     title = ""
     body_text = ""
+    image_urls: list[str] = []
+    seen_image_urls: set[str] = set()
 
     try:
         import re
@@ -829,6 +1129,14 @@ def fetch_article_content(page, url: str) -> tuple[str, str]:
 
             # 4. 精准提取完整的正文数组（躺在 JSON 里的 body 节点中）[cite: 6]
             body_components = content_data.get("body", [])
+            # 正文图通常在 body 中；部分漫画和导语图只出现在文章根节点的 lead image。
+            # 只读这些明确字段，不能再递归扫描整个 content，否则会混入 Explore more 的周刊封面。
+            for key in (
+                "image", "imageUrl", "image_url", "leadImage", "lead_image",
+                "leadMedia", "leadComponent", "media", "imageData",
+            ):
+                _collect_article_image_urls(content_data.get(key), image_urls, seen_image_urls)
+            _collect_article_image_urls(body_components, image_urls, seen_image_urls)
             paragraphs = []
 
             for node in body_components:
@@ -876,7 +1184,161 @@ def fetch_article_content(page, url: str) -> tuple[str, str]:
         title = title or (payload or {}).get("title", "")
         body_text = (payload or {}).get("body", "")
 
-    return title, body_text
+    for image_url in _visible_article_image_urls(page):
+        if image_url not in seen_image_urls:
+            seen_image_urls.add(image_url)
+            image_urls.append(image_url)
+    return title, body_text, image_urls
+
+
+def _image_extension(url: str, content_type: str) -> str:
+    content_type = content_type.lower().split(";", 1)[0].strip()
+    by_type = {
+        "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+        "image/webp": ".webp", "image/gif": ".gif",
+    }
+    if content_type in by_type:
+        return by_type[content_type]
+    suffix = Path(urlparse(url).path).suffix.lower()
+    return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif"} else ".jpg"
+
+
+def materialize_article_images(
+    image_urls: list[str], cfg: dict[str, Any], issue_date: str, article_id: str,
+) -> list[str]:
+    """下载图片到期刊目录；下载失败时保留原 URL，确保页面仍可展示。"""
+    if not image_urls:
+        return []
+    try:
+        import requests
+    except ImportError as exc:
+        log.warning(f"未安装 requests，图片保留远程 URL: {exc}")
+        return image_urls
+
+    image_dir = _paper_output_root(cfg) / PAPER_PUBLICATION_TYPE / issue_date / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[str] = []
+    for index, image_url in enumerate(image_urls[:20], start=1):
+        try:
+            response = requests.get(
+                image_url,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"},
+                timeout=30,
+            )
+            content_type = response.headers.get("Content-Type", "")
+            if response.status_code != 200 or not content_type.lower().startswith("image/"):
+                raise ValueError(f"HTTP {response.status_code}, Content-Type={content_type!r}")
+            filename = f"{article_id}_{index:02d}{_image_extension(image_url, content_type)}"
+            target = image_dir / filename
+            _write_atomic_bytes(target, response.content)
+            paths.append(f"images/{filename}")
+        except Exception as exc:
+            log.warning(f"图片下载失败，保留远程 URL: {image_url[:100]} ({exc})")
+            paths.append(image_url)
+    return paths
+
+
+def analyze_article_images(
+    client: Any,
+    cfg: dict[str, Any],
+    issue_date: str,
+    title: str,
+    images: list[str],
+    log_: logging.Logger,
+) -> list[dict[str, Any]]:
+    """用 .env LLM 对正文图片/图表做 50-80 字中文简析。"""
+    settings = cfg["image_analysis"]
+    if not settings.get("enabled") or not images:
+        return []
+    output_root = _paper_output_root(cfg)
+    content: list[dict[str, Any]] = [{
+        "type": "text",
+        "text": (
+            "请逐张分析下面文章中的图片或图表。每张只写一段 50-80 个中文字符的简短说明，"
+            "说明画面/图表展示的内容及其与文章的关系；不要编造图片中看不出的数字或事实。"
+            "返回严格 JSON，不要 Markdown。格式："
+            '{"images":[{"index":1,"image_type":"photo|chart|cartoon|illustration",'
+            '"description":"50-80字中文简析"}]}\n文章标题：' + title
+        ),
+    }]
+    usable_images = images[: max(1, int(settings["max_images"]))]
+    for image_path in usable_images:
+        if image_path.startswith("images/"):
+            local_path = output_root / PAPER_PUBLICATION_TYPE / issue_date / image_path
+            try:
+                import base64
+                import mimetypes
+                mime = mimetypes.guess_type(local_path.name)[0] or "image/jpeg"
+                data = base64.b64encode(local_path.read_bytes()).decode("ascii")
+                image_url = f"data:{mime};base64,{data}"
+            except Exception as exc:
+                log_.warning(f"读取本地图片失败，跳过解析 {image_path}: {exc}")
+                continue
+        elif _is_article_image_url(image_path):
+            image_url = image_path
+        else:
+            continue
+        content.append({"type": "image_url", "image_url": {"url": image_url, "detail": "low"}})
+
+    if len(content) == 1:
+        return []
+    model = settings.get("model") or cfg["llm"].get("model", "gpt-4o-mini")
+    for attempt in range(int(settings["max_retries"]) + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "你是严谨的图片与数据图表编辑，只返回 JSON。"},
+                    {"role": "user", "content": content},
+                ],
+                max_tokens=int(settings["max_tokens"]),
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            raw = _extract_json_payload(response.choices[0].message.content or "")
+            raw_items = (
+                raw.get("images")
+                or raw.get("image_insights")
+                or raw.get("analyses")
+                or raw.get("items")
+                or []
+            )
+            if not isinstance(raw_items, list):
+                raise ValueError("图片解析结果不是 images 数组")
+            insights: list[dict[str, Any]] = []
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    index = int(item.get("index") or item.get("image_index") or item.get("image_number") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if index == 0 and len(usable_images) == 1:
+                    index = 1
+                description = str(
+                    item.get("description") or item.get("analysis") or item.get("caption") or ""
+                ).strip()
+                if 35 <= count_cn_chars(description) < 50:
+                    description += "，帮助读者把握文章所讨论的背景与变化。"
+                if not (1 <= index <= len(usable_images)) or not (50 <= count_cn_chars(description) <= 80):
+                    continue
+                image_type = str(item.get("image_type") or "illustration").strip().lower()
+                if image_type not in {"photo", "chart", "cartoon", "illustration"}:
+                    image_type = "illustration"
+                insights.append({
+                    "path": usable_images[index - 1],
+                    "image_type": image_type,
+                    "description": description,
+                })
+            if insights:
+                return insights
+            raise ValueError(
+                "图片解析结果没有合格的 50-80 字说明: "
+                + json.dumps(raw, ensure_ascii=False)[:500]
+            )
+        except Exception as exc:
+            log_.warning(f"图片解析失败 (attempt {attempt + 1}): {exc}")
+    return []
 
 
 def _parse_article_html(html: str) -> tuple[str, str]:
@@ -1056,13 +1518,383 @@ def count_cn_chars(s: str) -> int:
     return len(CN_CHAR_RE.findall(s))
 
 
+def _split_article_paragraphs(body: str) -> list[dict[str, str]]:
+    """把文章正文拆成可翻译段落,保留 crosshead / 普通段落的角色信息。"""
+    paragraphs: list[dict[str, str]] = []
+    for part in re.split(r"\n\s*\n", str(body or "").strip()):
+        text = part.strip()
+        if not text:
+            continue
+        role = "body"
+        if text.startswith("## "):
+            role = "crosshead"
+            text = text[3:].strip()
+        elif text.startswith("### "):
+            role = "crosshead"
+            text = text[4:].strip()
+        paragraphs.append({"role": role, "en_text": text})
+    return paragraphs
+
+
+def _format_source_content_markdown(paragraphs: list[dict[str, str]]) -> str:
+    """把源正文整理成稳定的英文 Markdown。"""
+    rendered: list[str] = []
+    for paragraph in paragraphs:
+        text = str(paragraph.get("en_text") or "").strip()
+        if not text:
+            continue
+        if paragraph.get("role") == "crosshead":
+            rendered.append(f"## {text}")
+        else:
+            rendered.append(text)
+    return "\n\n".join(rendered).strip()
+
+
+def _extract_json_payload(text: str) -> dict[str, Any]:
+    """从 LLM 响应里抠出 JSON object。"""
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw, flags=re.IGNORECASE).strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        raw = raw[start:end + 1]
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("LLM JSON 不是 object")
+    return data
+
+
+def _normalise_compiled_paragraphs(
+    source_paragraphs: list[dict[str, str]],
+    raw_paragraphs: Any,
+    article_id: str,
+) -> list[dict[str, str]]:
+    """把 LLM 翻译结果对齐回原始段落。"""
+    translated: list[dict[str, str]] = []
+    raw_items = raw_paragraphs if isinstance(raw_paragraphs, list) else []
+    for index, source in enumerate(source_paragraphs, start=1):
+        raw_item = raw_items[index - 1] if index - 1 < len(raw_items) else {}
+        if not isinstance(raw_item, dict):
+            raw_item = {}
+        zh_text = str(raw_item.get("zh_text") or raw_item.get("translation") or "").strip()
+        role = str(raw_item.get("role") or source.get("role") or "body").strip() or "body"
+        translated.append(
+            {
+                "para_id": str(raw_item.get("para_id") or f"{article_id}_p{index}"),
+                "en_text": str(source.get("en_text") or "").strip(),
+                "zh_text": zh_text,
+                "role": role,
+            }
+        )
+    return translated
+
+
+def _glossary_id(term: str, term_type: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", term.lower()).strip("-")[:80]
+    return f"{term_type}-{slug or 'term'}"
+
+
+def _glossary_prompt(title: str, paragraphs: list[dict[str, str]], max_terms: int) -> str:
+    rendered = []
+    for index, paragraph in enumerate(paragraphs, start=1):
+        zh_text = str(paragraph.get("zh_text") or "").strip()
+        if zh_text:
+            rendered.append(f"[P{index}.ZH] {zh_text}")
+    return f"""You are a senior English-Chinese translator and global political-economic background editor. Analyze the Chinese translation below and select at most {max_terms} English-language proper terms that genuinely need contextual explanation for a Chinese reader.
+
+Only annotate an exact English substring that remains visible in [P<number>.ZH]. Never annotate ordinary English vocabulary, generic abstract concepts, common roles, or terms such as democracy, inflation, President, US, CEO and similar common words.
+
+Allowed types only: person, organization, company, policy_law, event, place_context, work, proper_concept, acronym.
+Each description_zh must be an objective Chinese introduction of roughly 100-200 Chinese characters, stating what it is and why it matters in this article. Do not invent facts. An occurrence may contain only the first useful occurrence in the Chinese column.
+
+Return strict JSON only. Do not quote or reproduce the article outside the exact surface field.
+
+Article title: {title}
+
+{chr(10).join(rendered)}
+
+Return JSON ONLY:
+{{
+  "terms": [
+    {{
+      "term": "Jerome Powell",
+      "term_zh": "杰罗姆·鲍威尔",
+      "type": "person",
+      "description_zh": "100-200字中文介绍",
+      "occurrences": [
+        {{"paragraph_index": 3, "text_field": "zh_text", "surface": "Jerome Powell", "occurrence": 1}}
+      ]
+    }}
+  ]
+}}"""
+
+
+def enrich_article_glossary(
+    client: Any, cfg: dict[str, Any], article: dict[str, Any], log_: logging.Logger,
+) -> dict[str, Any]:
+    """按 auto-paper-md-converter 的 glossary schema 为文章添加可定位术语。"""
+    glossary_cfg = cfg["glossary"]
+    paragraphs = article.get("paragraphs") or []
+    if not glossary_cfg.get("enabled") or not any(p.get("zh_text") for p in paragraphs):
+        article["glossary_entries"] = []
+        article["term_annotations"] = []
+        article["glossary_analysis_complete"] = False
+        article["glossary_version"] = 0
+        return article
+
+    model = glossary_cfg.get("model") or cfg["llm"].get("model", "gpt-4o-mini")
+    prompt = _glossary_prompt(article["title"], paragraphs, max(1, int(glossary_cfg["max_terms"])))
+    raw_terms: Any = []
+    for attempt in range(int(glossary_cfg["max_retries"]) + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": "Return JSON only."}, {"role": "user", "content": prompt}],
+                max_tokens=int(glossary_cfg["max_tokens"]),
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            raw_terms = _extract_json_payload(response.choices[0].message.content or "").get("terms", [])
+            break
+        except Exception as exc:
+            log_.warning(f"关键词解析失败 (attempt {attempt + 1}): {exc}")
+    if not isinstance(raw_terms, list):
+        raw_terms = []
+
+    entries: list[dict[str, Any]] = []
+    annotations: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for raw in raw_terms:
+        if len(entries) >= int(glossary_cfg["max_terms"]) or not isinstance(raw, dict):
+            break
+        term = str(raw.get("term") or raw.get("canonical_term") or "").strip()
+        term_type = str(raw.get("type") or "proper_concept").strip().lower()
+        description = str(raw.get("description_zh") or raw.get("explanation_zh") or "").strip()
+        if not term or term_type not in GLOSSARY_TYPES or len(CN_CHAR_RE.findall(description)) < 60:
+            continue
+        glossary_id = _glossary_id(term, term_type)
+        if glossary_id in seen_ids:
+            continue
+        valid_occurrences = []
+        for occurrence in raw.get("occurrences") or []:
+            if not isinstance(occurrence, dict):
+                continue
+            try:
+                paragraph_index = int(occurrence.get("paragraph_index") or 0)
+                ordinal = max(int(occurrence.get("occurrence") or 1), 1)
+            except (ValueError, TypeError):
+                continue
+            surface = str(occurrence.get("surface") or term).strip()
+            if not (1 <= paragraph_index <= len(paragraphs)):
+                continue
+            zh_text = str(paragraphs[paragraph_index - 1].get("zh_text") or "")
+            if surface and surface in zh_text:
+                valid_occurrences.append({
+                    "glossary_id": glossary_id, "paragraph_index": paragraph_index,
+                    "text_field": "zh_text", "surface": surface, "occurrence": ordinal,
+                })
+        if not valid_occurrences:
+            continue
+        seen_ids.add(glossary_id)
+        entries.append({
+            "id": glossary_id, "term": term, "term_zh": str(raw.get("term_zh") or "").strip(),
+            "type": term_type, "description_zh": description[:200].rstrip(), "version": GLOSSARY_VERSION,
+        })
+        annotations.extend(valid_occurrences[:1])
+    article["glossary_entries"] = entries
+    article["term_annotations"] = annotations
+    article["glossary_analysis_complete"] = True
+    article["glossary_version"] = GLOSSARY_VERSION
+    return article
+
+
+def _compile_article_prompt(
+    title: str,
+    section: str,
+    paragraphs: list[dict[str, str]],
+) -> str:
+    paragraph_lines = []
+    for index, paragraph in enumerate(paragraphs, start=1):
+        role = paragraph.get("role") or "body"
+        text = str(paragraph.get("en_text") or "").strip()
+        if not text:
+            continue
+        paragraph_lines.append(f"{index}. [{role}] {text}")
+
+    return f"""You are a meticulous English-Chinese editor for The Economist.
+
+Translate and structure the following article into STRICT JSON only.
+
+Rules:
+- Keep the meaning faithful and do not add facts.
+- title_zh must be a concise, natural Chinese title.
+- summary_md must be a cohesive, flowing Chinese analysis of 400-500 Chinese characters, never exceeding 600 Chinese characters. Naturally integrate the core message, key arguments, supporting evidence, and potential implications. Use professional prose for a knowledgeable Chinese reader. Do not use bullet points, numbered lists, or section headers.
+- Translate every paragraph semantically and naturally, not word-for-word.
+- Preserve the paragraph order and count exactly.
+- If a paragraph is a subheading/crosshead, translate it as a short Chinese heading.
+- For proper nouns that need context, retain the English original at first mention in parentheses so they can be annotated later.
+- Return JSON only. No Markdown fences, no explanations, no extra text.
+
+Title: {title}
+Section: {section}
+
+Source paragraphs:
+{chr(10).join(paragraph_lines)}
+
+Return JSON in this shape:
+{{
+  "title_zh": "中文标题",
+  "summary_md": "一句中文解读",
+  "paragraphs": [
+    {{
+      "zh_text": "中文翻译",
+      "role": "body"
+    }}
+  ]
+}}
+"""
+
+
+def compile_article_record(
+    client: Any,
+    cfg: dict[str, Any],
+    *,
+    issue_date: str,
+    section: str,
+    title: str,
+    url: str,
+    body: str,
+    article_id: str,
+    log_: logging.Logger,
+    images: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """把抓到的正文编译成 Economist 前端需要的结构化 article。"""
+    source_paragraphs = _split_article_paragraphs(body)
+    if not source_paragraphs:
+        if not images:
+            return None
+        article = {
+            "id": article_id,
+            "issue_date": issue_date,
+            "section": section,
+            "title": title,
+            "title_zh": "",
+            "url": url,
+            "summary_md": "",
+            "content_raw": "",
+            "content_markdown": "",
+            "paragraphs": [],
+            "images": images,
+            "image_insights": analyze_article_images(client, cfg, issue_date, title, images, log_),
+            "glossary_entries": [],
+            "term_annotations": [],
+            "glossary_analysis_complete": False,
+            "glossary_version": 0,
+            "compiled_article": False,
+            "compile_status": "image_only",
+        }
+        return article
+
+    prompt = _compile_article_prompt(title=title, section=section, paragraphs=source_paragraphs)
+    llm = cfg["llm"]
+    max_tokens = max(int(llm.get("max_tokens", 2048)), 4096)
+
+    last_error: Exception | None = None
+    for attempt in range(int(cfg["crawl"].get("max_retries", 2)) + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=llm.get("model", "gpt-4o-mini"),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Return JSON only. Translate The Economist articles into faithful Chinese.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=max_tokens,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            payload = _extract_json_payload(resp.choices[0].message.content or "")
+            title_zh = str(payload.get("title_zh") or "").strip()
+            summary_md = str(payload.get("summary_md") or "").strip()
+            compiled_paragraphs = _normalise_compiled_paragraphs(
+                source_paragraphs,
+                payload.get("paragraphs"),
+                article_id,
+            )
+            if not title_zh or not summary_md:
+                raise ValueError("LLM 结构化输出缺少 title_zh 或 summary_md")
+            summary_cn_chars = count_cn_chars(summary_md)
+            if not 400 <= summary_cn_chars <= 600:
+                raise ValueError(
+                    f"中文解读字数不合格({summary_cn_chars}，要求 400-600 中文字符)"
+                )
+
+            article = {
+                "id": article_id,
+                "issue_date": issue_date,
+                "section": section,
+                "title": title,
+                "title_zh": title_zh,
+                "url": url,
+                "summary_md": summary_md,
+                "content_raw": _format_source_content_markdown(source_paragraphs),
+                "content_markdown": _format_source_content_markdown(source_paragraphs),
+                "paragraphs": compiled_paragraphs,
+                "images": images or [],
+                "image_insights": analyze_article_images(client, cfg, issue_date, title, images or [], log_),
+                "compiled_article": True,
+                "compile_status": "complete",
+            }
+            return enrich_article_glossary(client, cfg, article, log_)
+        except Exception as exc:
+            last_error = exc
+            log_.warning(f"结构化编译失败 (attempt {attempt + 1}): {exc}")
+            time.sleep(1.0)
+
+    log_.warning(f"结构化编译失败,回退到仅摘要模式: {title} ({last_error})")
+    summary = summarize(client, cfg, title, body, log_)
+    fallback_paragraphs = [
+        {
+            "para_id": f"{article_id}_p{index}",
+            "en_text": str(paragraph.get("en_text") or ""),
+            "zh_text": "",
+            "role": str(paragraph.get("role") or "body"),
+        }
+        for index, paragraph in enumerate(source_paragraphs, start=1)
+    ]
+    article = {
+        "id": article_id,
+        "issue_date": issue_date,
+        "section": section,
+        "title": title,
+        "title_zh": "",
+        "url": url,
+        "summary_md": summary,
+        "content_raw": _format_source_content_markdown(source_paragraphs),
+        "content_markdown": _format_source_content_markdown(source_paragraphs),
+        "paragraphs": fallback_paragraphs,
+        "images": images or [],
+        "image_insights": analyze_article_images(client, cfg, issue_date, title, images or [], log_),
+        "compiled_article": False,
+        "compile_status": "fallback",
+    }
+    return enrich_article_glossary(client, cfg, article, log_)
+
+
 # ---------------------------------------------------------------------------
 # 飞书推送
 # ---------------------------------------------------------------------------
 
 
 def build_feishu_card(articles: list[dict[str, Any]], issue_date: str) -> dict[str, Any]:
-    lines = "\n".join(f"- **[{a['section']}]** {a['title']}" for a in articles)
+    lines = "\n".join(
+        f"- **[{a.get('section', 'General')}]** {a.get('title_zh') or a.get('title')}"
+        for a in articles
+    )
     return {
         "msg_type": "interactive",
         "card": {
@@ -1129,6 +1961,7 @@ def process_issue(
     issue_date: str,
     *,
     dry_run: bool = False,
+    limit: int = 0,
     rewrite_id: str | None = None,
     no_feishu: bool = False,
     debug_html_dir: Path | None = None,
@@ -1147,9 +1980,10 @@ def process_issue(
         log.info(f"目录共 {len(index)} 条链接")
         # 板块过滤
         candidates = [a for a in index if is_allowed_article(a["url"], a["section"])]
-        log.info(f"板块过滤后剩 {len(candidates)} 条")
+        log.info(f"非文章链接过滤后剩 {len(candidates)} 条")
         if dry_run:
-            for c in candidates:
+            dry_candidates = candidates[:limit] if limit > 0 else candidates
+            for c in dry_candidates:
                 print(f"[DRY] {c['issue_date']}  {c['section']:25s}  {c['title']}  {c['url']}")
             return []
 
@@ -1164,10 +1998,14 @@ def process_issue(
         # existing 是可变 list,每收录一篇就 append,write_database_js 拿最新 list 写盘
         seq = _next_seq(existing, issue_date)
         log.info(
-            f"开始逐篇抓取(已存在 {len(existing_by_url)} 篇,本 issue 板块过滤后 {len(candidates)} 条)"
+            f"开始逐篇抓取(已存在 {len(existing_by_url)} 篇,本 issue 可抓取 {len(candidates)} 条"
+            f"{f', 本 run 最多新增 {limit} 篇' if limit > 0 else ''})"
         )
 
         for cand in candidates:
+            if limit > 0 and len(new_articles) >= limit:
+                log.info(f"已达到本 run 限制 {limit} 篇,停止继续抓取")
+                break
             url = cand["url"]
             if url in existing_by_url and not rewrite_id:
                 log.info(f"⏭ 已存在,跳过: {cand['title'][:50]}  ({url[:60]}…)")
@@ -1175,31 +2013,34 @@ def process_issue(
 
             log.info(f"抓取正文: {cand['title'][:60]}")
             try:
-                title, body = fetch_article_content(page, url)
+                title, body, image_urls = fetch_article_content(page, url)
             except Exception as e:
                 log.warning(f"抓取失败 {url}: {e}")
                 time.sleep(random.uniform(delay_min, delay_max))
                 continue
-            if len(body) < MIN_EN_CHARS:
-                log.warning(f"原文过短({len(body)}<{MIN_EN_CHARS}),丢弃: {url}")
+            if not body.strip() and not image_urls:
+                log.warning(f"未提取到正文或图片，丢弃: {url}")
                 time.sleep(random.uniform(delay_min, delay_max))
                 continue
 
             title = title or cand["title"]
-            summary = summarize(client, cfg, title, body, log)
-            if not summary:
+            article_id = f"art_{issue_date}_{seq:03d}"
+            images = materialize_article_images(image_urls, cfg, issue_date, article_id)
+            article = compile_article_record(
+                client,
+                cfg,
+                issue_date=issue_date,
+                section=cand["section"],
+                title=title,
+                url=url,
+                body=body,
+                article_id=article_id,
+                log_=log,
+                images=images,
+            )
+            if not article:
                 time.sleep(random.uniform(delay_min, delay_max))
                 continue
-
-            article = {
-                "issue_date": issue_date,
-                "id": f"art_{issue_date}_{seq:03d}",
-                "section": cand["section"],
-                "title": title,
-                "url": url,
-                "summary_md": summary,
-                "content_raw": body,
-            }
             # 立即落盘:用户刷新 index.html 就能看到刚抓的那篇
             existing.append(article)
             existing_by_url[url] = article
@@ -1207,6 +2048,10 @@ def process_issue(
             seq += 1
             try:
                 write_database_js(existing)
+                try:
+                    _sync_paper_outputs(cfg, existing, issue_date=issue_date)
+                except Exception as sync_exc:
+                    log.warning(f"paper 输出同步失败(不影响旧 database.js): {sync_exc}")
                 log.info(
                     f"✓ 已收录并落盘: {article['id']} - {title[:60]}  "
                     f"(本 run 第 {len(new_articles)} 篇 / 累计 {len(existing)} 篇)"
@@ -1230,6 +2075,54 @@ def process_issue(
         elif not new_articles:
             log.info("本 run 无新增文章,不发飞书(避免空推)")
         return new_articles
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+
+def refresh_article_images(
+    cfg: dict[str, Any], issue_date: str, article_ids: set[str], no_feishu: bool = True,
+) -> list[dict[str, Any]]:
+    """只刷新指定文章的正文图片和图片解析，不重新抓取或翻译正文。"""
+    existing = read_database_js()
+    targets = [
+        article for article in existing
+        if article.get("issue_date") == issue_date
+        and (not article_ids or article.get("id") in article_ids)
+    ]
+    if not targets:
+        log.warning(f"没有找到待刷新图片的文章: issue={issue_date}, ids={sorted(article_ids)}")
+        return []
+
+    page = open_browser(cfg["browser"]["user_data_path"], bool(cfg["browser"].get("headless", False)))
+    client = make_llm_client(cfg)
+    refreshed: list[dict[str, Any]] = []
+    try:
+        for article in targets:
+            url = str(article.get("url") or "")
+            try:
+                _, _, image_urls = fetch_article_content(page, url)
+                article["images"] = materialize_article_images(
+                    image_urls, cfg, issue_date, str(article.get("id") or "article")
+                )
+                article["image_insights"] = analyze_article_images(
+                    client, cfg, issue_date, str(article.get("title") or ""), article["images"], log
+                )
+                refreshed.append(article)
+                log.info(
+                    f"[images] 已刷新 {article.get('id')}: "
+                    f"{len(article['images'])} 张图片, {len(article['image_insights'])} 条解析"
+                )
+            except Exception as exc:
+                log.warning(f"[images] 刷新失败 {url}: {exc}")
+        write_database_js(existing)
+        _sync_paper_outputs(cfg, existing, issue_date=issue_date)
+        _maybe_rebuild_index(cfg)
+        if refreshed and not no_feishu:
+            push_feishu(cfg, build_feishu_card(refreshed, issue_date), log)
+        return refreshed
     finally:
         try:
             page.close()
@@ -1373,6 +2266,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="经济学人周报抓取与归档")
     p.add_argument("--dry-run", action="store_true", help="只列链接,不入库不推")
     p.add_argument("--issue", default=None, help="指定 issue 日期 (YYYY-MM-DD)")
+    p.add_argument("--limit", type=int, default=0, help="限制本次最多新增文章数(0=不限制)")
+    p.add_argument("--refresh-images", action="store_true",
+                   help="只重新抓取现有文章的正文图片并生成图片解析，不重抓正文")
+    p.add_argument("--article-ids", default="",
+                   help="配合 --refresh-images 使用，逗号分隔的 article id；留空表示本期全部")
     p.add_argument("--no-feishu", action="store_true", help="不推飞书")
     p.add_argument("--rewrite-id", default=None, help="强制重写指定 id 的文章")
     p.add_argument("--single-url", default=None, metavar="URL",
@@ -1444,30 +2342,44 @@ def process_single_url(
     """
     if "economist.com" not in url:
         log.warning(f"URL 不像 Economist 域名,继续尝试: {url}")
-    if any(kw in url for kw in DENY_PATH_KEYWORDS):
-        log.warning(f"URL 命中黑名单板块,但因 --single-url 显式指定,仍继续: {url}")
-
     browser_cfg = cfg["browser"]
     page = open_browser(browser_cfg["user_data_path"], bool(browser_cfg.get("headless", False)))
     try:
         log.info(f"[single-url] 抓取: {url}")
-        title, body = fetch_article_content(page, url)
-        if len(body) < MIN_EN_CHARS:
-            log.warning(f"原文过短({len(body)}<{MIN_EN_CHARS}),丢弃: {url}")
+        title, body, image_urls = fetch_article_content(page, url)
+        if not body.strip() and not image_urls:
+            log.warning(f"未提取到正文或图片，丢弃: {url}")
             return []
         log.info(f"[single-url] 抓取成功 title={title!r}  body={len(body)} chars")
 
         client = make_llm_client(cfg)
-        summary = summarize(client, cfg, title, body, log)
-        if not summary:
-            log.warning(f"[single-url] LLM 摘要失败,丢弃: {url}")
+        article, existing_after = _resolve_single_url_article(
+            url, title, body, "", section=section,
+        )
+        images = materialize_article_images(image_urls, cfg, article["issue_date"], article["id"])
+        compiled = compile_article_record(
+            client,
+            cfg,
+            issue_date=article["issue_date"],
+            section=article["section"],
+            title=article["title"],
+            url=article["url"],
+            body=body,
+            article_id=article["id"],
+            log_=log,
+            images=images,
+        )
+        if not compiled:
+            log.warning(f"[single-url] 结构化编译失败,丢弃: {url}")
             return []
 
-        article, existing_after = _resolve_single_url_article(
-            url, title, body, summary, section=section,
-        )
+        article = compiled
         write_database_js(existing_after + [article])
         log.info(f"[single-url] ✓ 已写入: {article['id']} - {article['title']}")
+        try:
+            _sync_paper_outputs(cfg, existing_after + [article], issue_date=article["issue_date"])
+        except Exception as sync_exc:
+            log.warning(f"[single-url] paper 输出同步失败(不影响旧 database.js): {sync_exc}")
         _maybe_rebuild_index(cfg)
         _maybe_export_article_md(cfg, article)
 
@@ -1520,11 +2432,18 @@ def main() -> int:
         cfg_b = cfg["browser"]
         _cleanup_stale_chrome_locks(cfg_b["user_data_path"])
     issue_date = args.issue or datetime.now().strftime("%Y-%m-%d")
+    if args.refresh_images:
+        article_ids = {item.strip() for item in args.article_ids.split(",") if item.strip()}
+        log.info(f"=== 刷新图片 issue={issue_date}, ids={sorted(article_ids) or 'all'} ===")
+        refresh_article_images(cfg, issue_date, article_ids, no_feishu=args.no_feishu)
+        log.info("=== 结束 ===")
+        return 0
     log.info(f"=== 启动 sync_weekly  issue={issue_date}  dry-run={args.dry_run} ===")
     process_issue(
         cfg,
         issue_date,
         dry_run=args.dry_run,
+        limit=max(0, args.limit),
         rewrite_id=args.rewrite_id,
         no_feishu=args.no_feishu,
         debug_html_dir=Path(args.debug_html) if args.debug_html else None,
