@@ -21,7 +21,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 # 延迟导入 requests/openai,方便无 LLM 依赖环境下跑单元测试。
 # 真正调用 LLM / 推飞书时才触发。
@@ -1175,6 +1175,64 @@ def _visible_article_image_urls(page) -> list[str]:
     return [value for value in values if _is_article_image_url(value)]
 
 
+def _parse_interactive_article_html(html_source: str) -> tuple[str, str, list[str]]:
+    """Extract article content from Economist's standalone Svelte interactives."""
+    try:
+        from lxml import html as lxml_html  # type: ignore
+    except ImportError:
+        return "", "", []
+
+    try:
+        document = lxml_html.fromstring(html_source)
+    except (TypeError, ValueError):
+        return "", "", []
+
+    main_nodes = document.xpath("//main")
+    main = main_nodes[0] if main_nodes else document
+    title_nodes = main.xpath(".//h1") or document.xpath("//h1")
+    title = ""
+    if title_nodes:
+        title = " ".join(" ".join(title_nodes[0].itertext()).split())
+
+    blocks: list[str] = []
+    seen_blocks: set[str] = set()
+    for node in main.xpath(".//body-text"):
+        text = " ".join(" ".join(node.itertext()).split())
+        if len(text) < 20 or text in seen_blocks:
+            continue
+        seen_blocks.add(text)
+        blocks.append(text)
+
+    image_urls: list[str] = []
+    seen_images: set[str] = set()
+    for image in main.xpath(".//img"):
+        if any(
+            ancestor.tag == "footer"
+            or "related-content" in str(ancestor.get("class", ""))
+            for ancestor in image.iterancestors()
+        ):
+            continue
+        candidates = [
+            image.get("src", ""),
+            image.get("data-src", ""),
+            image.get("data-original", ""),
+        ]
+        for srcset_name in ("srcset", "data-srcset"):
+            srcset = image.get(srcset_name, "")
+            candidates.extend(
+                item.strip().split()[0]
+                for item in srcset.split(",")
+                if item.strip()
+            )
+        for candidate in candidates:
+            resolved = urljoin("https://www.economist.com", candidate.strip())
+            if _is_article_image_url(resolved) and resolved not in seen_images:
+                seen_images.add(resolved)
+                image_urls.append(resolved)
+
+    return title, "\n\n".join(blocks), image_urls
+
+
 def fetch_article_content(page, url: str) -> tuple[str, str, list[str]]:
     """访问单篇文章，返回 (title, content_raw, image_urls)。
 
@@ -1183,7 +1241,8 @@ def fetch_article_content(page, url: str) -> tuple[str, str, list[str]]:
     """
     page.get(url)
     page.wait.load_start()
-    time.sleep(1.5)  # 留出基础网络数据就绪时间
+    is_interactive = "/interactive/" in urlparse(url).path
+    time.sleep(5.0 if is_interactive else 1.5)
 
     html_source = page.html
     title = ""
@@ -1237,6 +1296,20 @@ def fetch_article_content(page, url: str) -> tuple[str, str, list[str]]:
 
     except Exception as e:
         log.error(f"[single-url] 通过 JSON 核心提取正文失败，正在切换至常规 DOM 兜底保底: {e}")
+
+    if not body_text and is_interactive:
+        interactive_title, interactive_body, interactive_images = _parse_interactive_article_html(html_source)
+        title = title or interactive_title
+        body_text = interactive_body
+        for image_url in interactive_images:
+            if image_url not in seen_image_urls:
+                seen_image_urls.add(image_url)
+                image_urls.append(image_url)
+        if body_text:
+            log.info(
+                "[single-url] 成功通过交互页 HTML 通道提取全文，共 "
+                f"{len(body_text.split(chr(10) + chr(10)))} 个正文组件。"
+            )
 
     # =========================================================================
     # 🌟 强力兜底保底逻辑：如果上面的原生通道发生未料异常，用硬捞机制保底
@@ -1866,7 +1939,7 @@ Translate and structure the following article into STRICT JSON only.
 Rules:
 - Keep the meaning faithful and do not add facts.
 - title_zh must be a concise, natural Chinese title.
-- summary_md must be a cohesive, flowing Chinese analysis of 400-500 Chinese characters, never exceeding 600 Chinese characters. Naturally integrate the core message, key arguments, supporting evidence, and potential implications. Use professional prose for a knowledgeable Chinese reader. Do not use bullet points, numbered lists, or section headers.
+- summary_md must be a cohesive, flowing Chinese analysis of 500-550 Chinese Han characters, never exceeding 600 Chinese Han characters. Naturally integrate the core message, key arguments, supporting evidence, and potential implications. Use professional prose for a knowledgeable Chinese reader. Do not use bullet points, numbered lists, or section headers. Before returning the JSON, silently count the Chinese Han characters in summary_md and expand it when the count is below 500; do not include the count in the output.
 - Translate every paragraph semantically and naturally, not word-for-word.
 - Preserve the paragraph order and count exactly.
 - If a paragraph is a subheading/crosshead, translate it as a short Chinese heading.
@@ -1883,7 +1956,7 @@ Source paragraphs:
 Return JSON in this shape:
 {{
   "title_zh": "中文标题",
-  "summary_md": "一句中文解读",
+  "summary_md": "完整、连贯的长篇中文解读",
   "paragraphs": [
     {{
       "zh_text": "中文翻译",
