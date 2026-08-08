@@ -33,10 +33,20 @@ from urllib.parse import urljoin, urlparse
 NON_ARTICLE_PATH_KEYWORDS: tuple[str, ...] = (
     "/topic/", "/person/", "/newsletters/", "/audio/", "/video/",
 )
-GLOSSARY_VERSION = 1
+GLOSSARY_VERSION = 2
+ZH_ENGLISH_CANDIDATE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"([A-Za-z][A-Za-z0-9]*(?:[.'’_-][A-Za-z0-9]+)*"
+    r"(?:(?:[ \t]+|,\s*)[A-Za-z&][A-Za-z0-9]*(?:[.'’_-][A-Za-z0-9]+)*){0,7})"
+    r"(?![A-Za-z0-9_])"
+)
 GLOSSARY_TYPES = {
     "person", "organization", "company", "policy_law", "event",
     "place_context", "work", "proper_concept", "acronym",
+}
+GENERIC_GLOSSARY_TERMS = {
+    "business", "ceo", "company", "democracy", "economy", "government",
+    "globalization", "inflation", "market", "president", "sovereignty", "us", "uk",
 }
 
 WEEKLY_URL = "https://www.economist.com/weeklyedition"
@@ -138,7 +148,9 @@ DEFAULTS = {
     "glossary": {
         "enabled": True,
         "model": "",
-        "max_terms": 12,
+        "max_terms": 32,
+        "max_candidates": 32,
+        "max_input_chars": 24000,
         "max_tokens": 5000,
         "max_retries": 2,
     },
@@ -235,6 +247,8 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
             or src.get("OPENAI_GLOSSARY_MODEL", "").strip()
         ),
         "glossary.max_terms": src.get("LLM_GLOSSARY_MAX_TERMS", "").strip(),
+        "glossary.max_candidates": src.get("LLM_GLOSSARY_MAX_ZH_CANDIDATES", "").strip(),
+        "glossary.max_input_chars": src.get("LLM_GLOSSARY_MAX_INPUT_CHARS", "").strip(),
         "glossary.max_tokens": src.get("LLM_GLOSSARY_MAX_TOKENS", "").strip(),
         "glossary.max_retries": src.get("LLM_GLOSSARY_MAX_RETRIES", "").strip(),
         "image_analysis.model": (
@@ -263,7 +277,7 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
     int_fields = {
         "llm": ["max_tokens", "timeout_s"],
         "crawl": ["delay_min_s", "delay_max_s", "max_retries"],
-        "glossary": ["max_terms", "max_tokens", "max_retries"],
+        "glossary": ["max_terms", "max_candidates", "max_input_chars", "max_tokens", "max_retries"],
         "image_analysis": ["max_tokens", "max_retries", "max_images"],
         "pipeline": ["compile_workers", "image_workers", "max_pending"],
     }
@@ -1793,20 +1807,102 @@ def _glossary_id(term: str, term_type: str) -> str:
     return f"{term_type}-{slug or 'term'}"
 
 
-def _glossary_prompt(title: str, paragraphs: list[dict[str, str]], max_terms: int) -> str:
-    rendered = []
-    for index, paragraph in enumerate(paragraphs, start=1):
-        zh_text = str(paragraph.get("zh_text") or "").strip()
-        if zh_text:
-            rendered.append(f"[P{index}.ZH] {zh_text}")
-    return f"""You are a senior English-Chinese translator and global political-economic background editor. Analyze the Chinese translation below and select at most {max_terms} English-language proper terms that genuinely need contextual explanation for a Chinese reader.
+def _clean_glossary_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
-Only annotate an exact English substring that remains visible in [P<number>.ZH]. Never annotate ordinary English vocabulary, generic abstract concepts, common roles, or terms such as democracy, inflation, President, US, CEO and similar common words.
+
+def _is_valuable_proper_term(term: str, term_type: str = "proper_concept") -> bool:
+    normalized = _clean_glossary_text(term)
+    lowered = normalized.casefold()
+    if len(normalized) < 2 or lowered in GENERIC_GLOSSARY_TERMS or not re.search(r"[A-Za-z]", normalized):
+        return False
+    if term_type == "acronym":
+        return bool(re.fullmatch(r"[A-Z][A-Z0-9.-]{1,15}", normalized))
+    if re.fullmatch(r"[a-z][a-z-]*", normalized):
+        return False
+    return bool(re.search(r"[A-Z]", normalized) or re.search(r"\d", normalized) or "." in normalized)
+
+
+def extract_zh_english_candidates(
+    paragraphs: list[dict[str, str]], max_candidates: int = 32,
+) -> list[dict[str, Any]]:
+    """确定性提取中文译文中仍可见的英文专名，供 LLM 逐项审查。"""
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for paragraph_index, paragraph in enumerate(paragraphs, start=1):
+        zh_text = str(paragraph.get("zh_text") or "")
+        for match in ZH_ENGLISH_CANDIDATE_RE.finditer(zh_text):
+            surface = _clean_glossary_text(match.group(1)).strip(" ,.;:!?()[]{}")
+            if not _is_valuable_proper_term(surface):
+                continue
+            key = surface.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({
+                "candidate_id": f"ZH{len(candidates) + 1}",
+                "paragraph_index": paragraph_index,
+                "text_field": "zh_text",
+                "surface": surface,
+            })
+            if len(candidates) >= max(1, max_candidates):
+                return candidates
+    return candidates
+
+
+def _glossary_prompt(
+    title: str,
+    paragraphs: list[dict[str, str]],
+    max_terms: int,
+    candidates: list[dict[str, Any]] | None = None,
+    *,
+    only_candidates: bool = False,
+    max_input_chars: int = 24000,
+) -> str:
+    rendered = []
+    used_chars = 0
+    for index, paragraph in enumerate(paragraphs, start=1):
+        lines = []
+        for field, marker in (("en_text", "EN"), ("zh_text", "ZH")):
+            text = str(paragraph.get(field) or "").strip()
+            if not text or used_chars >= max_input_chars:
+                continue
+            remaining = max_input_chars - used_chars
+            text = text[:remaining]
+            used_chars += len(text)
+            lines.append(f"[P{index}.{marker}] {text}")
+        if lines:
+            rendered.append("\n".join(lines))
+        if used_chars >= max_input_chars:
+            break
+
+    candidate_lines = "\n".join(
+        f'- [{item["candidate_id"]}] P{item["paragraph_index"]}.ZH: {item["surface"]}'
+        for item in (candidates or [])
+    )
+    if only_candidates:
+        selection_rule = """This is a coverage-repair request. Return entries only for the listed candidates. Every listed item has already passed a proper-name detector: include each one unless it is unmistakably ordinary vocabulary. Do not omit a person or other named entity merely because it is famous or obvious."""
+    else:
+        selection_rule = """Review every listed candidate individually. Include every actual named person, organization, company, law or policy, event, place, work, publication, project, mechanism, or acronym. A transliterated Chinese name followed by its English spelling in parentheses is always a high-priority person/name and must be included. The candidate list is a coverage floor, not the full set: also add other useful English proper terms visible in the Chinese column."""
+
+    return f"""You are a senior English-Chinese translator and global political-economic background editor. Analyze the bilingual article and return at most {max_terms} English-language proper terms that need contextual explanation for a Chinese reader.
+
+Only annotate an exact English substring that remains visible in [P<number>.ZH]. Never create an annotation in the English column. Never annotate ordinary English vocabulary, generic abstract concepts, common roles, or terms such as democracy, inflation, President, US, CEO and similar common words.
+
+{selection_rule}
+
+Candidates extracted from the Chinese column:
+{candidate_lines or "(none)"}
 
 Allowed types only: person, organization, company, policy_law, event, place_context, work, proper_concept, acronym.
-Each description_zh must be an objective Chinese introduction of roughly 100-200 Chinese characters, stating what it is and why it matters in this article. Do not invent facts. An occurrence may contain only the first useful occurrence in the Chinese column.
+For every selected term:
+- term must be the canonical English name and term_zh its conventional Chinese name.
+- For an extracted candidate, term must copy that candidate's English surface exactly apart from letter case. Put expansions or aliases in description_zh, never substitute a different canonical name.
+- description_zh must be an objective Chinese introduction of roughly 100-200 Chinese characters. State both who/what it is and its role or relevant background in this article. Do not invent facts.
+- occurrences may contain only the first useful occurrence in the Chinese column.
+- paragraph_index must use the [P<number>.ZH] marker, text_field must be zh_text, and surface must copy the exact visible English substring.
 
-Return strict JSON only. Do not quote or reproduce the article outside the exact surface field.
+Return strict JSON only. Do not reproduce the article outside the exact surface field.
 
 Article title: {title}
 
@@ -1828,6 +1924,51 @@ Return JSON ONLY:
 }}"""
 
 
+def _has_term_boundaries(text: str, start: int, length: int) -> bool:
+    before = text[start - 1] if start > 0 else ""
+    after_index = start + length
+    after = text[after_index] if after_index < len(text) else ""
+    first = text[start] if start < len(text) else ""
+    last = text[after_index - 1] if after_index > 0 else ""
+    word_char = re.compile(r"[A-Za-z0-9_]")
+    return not (
+        (first and before and word_char.fullmatch(first) and word_char.fullmatch(before))
+        or (last and after and word_char.fullmatch(last) and word_char.fullmatch(after))
+    )
+
+
+def _actual_occurrence_surface(text: str, surface: str, occurrence: int = 1) -> str:
+    if not text or not surface:
+        return ""
+    lowered_text = text.casefold()
+    lowered_surface = surface.casefold()
+    start = 0
+    found = -1
+    for _ in range(max(occurrence, 1)):
+        found = lowered_text.find(lowered_surface, start)
+        while found >= 0 and not _has_term_boundaries(text, found, len(surface)):
+            found = lowered_text.find(lowered_surface, found + 1)
+        if found < 0:
+            return ""
+        start = found + len(surface)
+    return text[found:found + len(surface)]
+
+
+def _find_glossary_occurrence(
+    paragraphs: list[dict[str, str]], surface: str, preferred_index: int = 0, occurrence: int = 1,
+) -> tuple[int, str] | None:
+    indexes = []
+    if 1 <= preferred_index <= len(paragraphs):
+        indexes.append(preferred_index)
+    indexes.extend(index for index in range(1, len(paragraphs) + 1) if index not in indexes)
+    for paragraph_index in indexes:
+        zh_text = str(paragraphs[paragraph_index - 1].get("zh_text") or "")
+        actual = _actual_occurrence_surface(zh_text, surface, occurrence)
+        if actual:
+            return paragraph_index, actual
+    return None
+
+
 def _apply_glossary_terms(
     article: dict[str, Any], raw_terms: Any, complete: bool, max_terms: int | None = None,
 ) -> dict[str, Any]:
@@ -1837,21 +1978,32 @@ def _apply_glossary_terms(
     annotations: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     max_terms = max(1, int(max_terms or DEFAULTS["glossary"]["max_terms"]))
+    if isinstance(raw_terms, dict):
+        raw_terms = raw_terms.get("terms", raw_terms.get("glossary", raw_terms.get("items", [])))
     if not isinstance(raw_terms, list):
         raw_terms = []
     for raw in raw_terms:
-        if len(entries) >= max_terms or not isinstance(raw, dict):
+        if len(entries) >= max_terms:
             break
-        term = str(raw.get("term") or raw.get("canonical_term") or "").strip()
+        if not isinstance(raw, dict):
+            continue
+        term = _clean_glossary_text(raw.get("term") or raw.get("canonical_term") or raw.get("name"))
         term_type = str(raw.get("type") or "proper_concept").strip().lower()
-        description = str(raw.get("description_zh") or raw.get("explanation_zh") or "").strip()
-        if not term or term_type not in GLOSSARY_TYPES or len(CN_CHAR_RE.findall(description)) < 60:
+        if term_type not in GLOSSARY_TYPES:
+            term_type = "proper_concept"
+        description = _clean_glossary_text(
+            raw.get("description_zh") or raw.get("explanation_zh") or raw.get("description")
+        )
+        if not _is_valuable_proper_term(term, term_type) or len(description) < 60:
             continue
         glossary_id = _glossary_id(term, term_type)
         if glossary_id in seen_ids:
             continue
         valid_occurrences = []
-        for occurrence in raw.get("occurrences") or []:
+        raw_occurrences = raw.get("occurrences") or raw.get("locations") or []
+        if isinstance(raw_occurrences, dict):
+            raw_occurrences = [raw_occurrences]
+        for occurrence in raw_occurrences:
             if not isinstance(occurrence, dict):
                 continue
             try:
@@ -1859,20 +2011,30 @@ def _apply_glossary_terms(
                 ordinal = max(int(occurrence.get("occurrence") or 1), 1)
             except (ValueError, TypeError):
                 continue
-            surface = str(occurrence.get("surface") or term).strip()
-            if not (1 <= paragraph_index <= len(paragraphs)):
+            surface = _clean_glossary_text(occurrence.get("surface") or term)
+            if surface.casefold() != term.casefold():
                 continue
-            zh_text = str(paragraphs[paragraph_index - 1].get("zh_text") or "")
-            if surface and surface in zh_text:
+            found = _find_glossary_occurrence(paragraphs, surface, paragraph_index, ordinal)
+            if found:
+                paragraph_index, actual_surface = found
                 valid_occurrences.append({
                     "glossary_id": glossary_id, "paragraph_index": paragraph_index,
-                    "text_field": "zh_text", "surface": surface, "occurrence": ordinal,
+                    "text_field": "zh_text", "surface": actual_surface, "occurrence": ordinal,
+                })
+        if not valid_occurrences:
+            found = _find_glossary_occurrence(paragraphs, term)
+            if found:
+                paragraph_index, actual_surface = found
+                valid_occurrences.append({
+                    "glossary_id": glossary_id, "paragraph_index": paragraph_index,
+                    "text_field": "zh_text", "surface": actual_surface, "occurrence": 1,
                 })
         if not valid_occurrences:
             continue
         seen_ids.add(glossary_id)
         entries.append({
-            "id": glossary_id, "term": term, "term_zh": str(raw.get("term_zh") or "").strip(),
+            "id": glossary_id, "term": term,
+            "term_zh": _clean_glossary_text(raw.get("term_zh") or raw.get("name_zh")),
             "type": term_type, "description_zh": description[:200].rstrip(), "version": GLOSSARY_VERSION,
         })
         annotations.extend(valid_occurrences[:1])
@@ -1881,6 +2043,85 @@ def _apply_glossary_terms(
     article["glossary_analysis_complete"] = complete
     article["glossary_version"] = GLOSSARY_VERSION if complete else 0
     return article
+
+
+def _covered_candidate_keys(
+    annotations: list[dict[str, Any]], entries: list[dict[str, Any]],
+) -> set[tuple[int, str]]:
+    entry_terms = {
+        str(item.get("id") or ""): str(item.get("term") or "").casefold()
+        for item in entries
+        if isinstance(item, dict)
+    }
+    return {
+        (int(item.get("paragraph_index") or 0), str(item.get("surface") or "").casefold())
+        for item in annotations
+        if isinstance(item, dict)
+        and entry_terms.get(str(item.get("glossary_id") or ""))
+        == str(item.get("surface") or "").casefold()
+    }
+
+
+def _missing_glossary_candidates(
+    candidates: list[dict[str, Any]], annotations: list[dict[str, Any]], entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    covered = _covered_candidate_keys(annotations, entries)
+    return [
+        candidate for candidate in candidates
+        if (candidate["paragraph_index"], candidate["surface"].casefold()) not in covered
+    ]
+
+
+def _merge_glossary_articles(
+    article: dict[str, Any], extra: dict[str, Any], max_terms: int,
+) -> dict[str, Any]:
+    entries: dict[str, dict[str, Any]] = {}
+    # 漏项补充结果优先，避免首次响应占满 max_terms 后再次挤掉高置信候选。
+    for entry in (extra.get("glossary_entries") or []) + (article.get("glossary_entries") or []):
+        if isinstance(entry, dict) and entry.get("id"):
+            entries[str(entry["id"])] = entry
+    annotations = []
+    seen = set()
+    for item in (extra.get("term_annotations") or []) + (article.get("term_annotations") or []):
+        if not isinstance(item, dict):
+            continue
+        key = (
+            item.get("glossary_id"), item.get("paragraph_index"),
+            str(item.get("surface") or "").casefold(), item.get("occurrence"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        annotations.append(item)
+    ordered_ids = list(entries)[:max_terms]
+    allowed_ids = set(ordered_ids)
+    article["glossary_entries"] = [entries[item] for item in ordered_ids]
+    article["term_annotations"] = [
+        item for item in annotations if item.get("glossary_id") in allowed_ids
+    ]
+    return article
+
+
+def _order_glossary_by_candidates(
+    article: dict[str, Any], candidates: list[dict[str, Any]],
+) -> None:
+    candidate_order = {
+        (item["paragraph_index"], item["surface"].casefold()): index
+        for index, item in enumerate(candidates)
+    }
+    entry_priority: dict[str, int] = {}
+    for annotation in article.get("term_annotations") or []:
+        key = (
+            int(annotation.get("paragraph_index") or 0),
+            str(annotation.get("surface") or "").casefold(),
+        )
+        if key in candidate_order:
+            entry_priority[str(annotation.get("glossary_id") or "")] = candidate_order[key]
+    entries = article.get("glossary_entries") or []
+    entries.sort(key=lambda item: entry_priority.get(str(item.get("id") or ""), len(candidates)))
+    entry_order = {str(item.get("id") or ""): index for index, item in enumerate(entries)}
+    annotations = article.get("term_annotations") or []
+    annotations.sort(key=lambda item: entry_order.get(str(item.get("glossary_id") or ""), len(entries)))
 
 
 def enrich_article_glossary(
@@ -1896,33 +2137,77 @@ def enrich_article_glossary(
         article["glossary_version"] = 0
         return article
 
+    max_terms = max(1, int(glossary_cfg["max_terms"]))
+    candidates = extract_zh_english_candidates(
+        paragraphs, max_candidates=max(1, int(glossary_cfg.get("max_candidates", 32)))
+    )
     model = glossary_cfg.get("model") or cfg["llm"].get("model", "gpt-4o-mini")
-    prompt = _glossary_prompt(article["title"], paragraphs, max(1, int(glossary_cfg["max_terms"])))
-    raw_terms: Any = []
-    for attempt in range(int(glossary_cfg["max_retries"]) + 1):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "system", "content": "Return JSON only."}, {"role": "user", "content": prompt}],
-                max_tokens=int(glossary_cfg["max_tokens"]),
-                temperature=0.2,
-                response_format={"type": "json_object"},
-            )
-            raw_terms = _extract_json_payload(response.choices[0].message.content or "").get("terms", [])
-            break
-        except Exception as exc:
-            log_.warning(f"关键词解析失败 (attempt {attempt + 1}): {exc}")
-            if not _should_retry_llm_error(exc, attempt, int(glossary_cfg["max_retries"])):
-                break
-    return _apply_glossary_terms(article, raw_terms, complete=True, max_terms=int(glossary_cfg["max_terms"]))
+
+    def request_terms(prompt: str, label: str) -> tuple[Any, bool]:
+        for attempt in range(int(glossary_cfg["max_retries"]) + 1):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "Return JSON only."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens=int(glossary_cfg["max_tokens"]),
+                    temperature=0.2,
+                    response_format={"type": "json_object"},
+                )
+                return _extract_json_payload(response.choices[0].message.content or ""), True
+            except Exception as exc:
+                log_.warning(f"{label}失败 (attempt {attempt + 1}): {exc}")
+                if not _should_retry_llm_error(exc, attempt, int(glossary_cfg["max_retries"])):
+                    break
+        return [], False
+
+    prompt = _glossary_prompt(
+        str(article.get("title") or "Untitled"), paragraphs, max_terms, candidates,
+        max_input_chars=max(2000, int(glossary_cfg.get("max_input_chars", 24000))),
+    )
+    raw_terms, succeeded = request_terms(prompt, "关键词解析")
+    _apply_glossary_terms(article, raw_terms, complete=False, max_terms=max_terms)
+
+    missing = _missing_glossary_candidates(
+        candidates,
+        article.get("term_annotations") or [],
+        article.get("glossary_entries") or [],
+    )
+    if succeeded and missing:
+        repair_limit = min(max_terms, len(missing))
+        repair_prompt = _glossary_prompt(
+            str(article.get("title") or "Untitled"), paragraphs, repair_limit, missing,
+            only_candidates=True,
+            max_input_chars=max(2000, int(glossary_cfg.get("max_input_chars", 24000))),
+        )
+        repair_terms, repair_succeeded = request_terms(repair_prompt, "关键词漏项补充解析")
+        if repair_succeeded:
+            extra = {"paragraphs": paragraphs}
+            _apply_glossary_terms(extra, repair_terms, complete=False, max_terms=repair_limit)
+            _merge_glossary_articles(article, extra, max_terms)
+
+    _order_glossary_by_candidates(article, candidates)
+    missing = _missing_glossary_candidates(
+        candidates,
+        article.get("term_annotations") or [],
+        article.get("glossary_entries") or [],
+    )
+    article["glossary_analysis_complete"] = bool(succeeded and not missing)
+    article["glossary_version"] = GLOSSARY_VERSION if article["glossary_analysis_complete"] else 0
+    if missing:
+        log_.warning(
+            "关键词解析仍遗漏中文栏候选: "
+            + ", ".join(str(item["surface"]) for item in missing[:10])
+        )
+    return article
 
 
 def _compile_article_prompt(
     title: str,
     section: str,
     paragraphs: list[dict[str, str]],
-    glossary_enabled: bool,
-    glossary_max_terms: int,
 ) -> str:
     paragraph_lines = []
     for index, paragraph in enumerate(paragraphs, start=1):
@@ -1943,9 +2228,8 @@ Rules:
 - Translate every paragraph semantically and naturally, not word-for-word.
 - Preserve the paragraph order and count exactly.
 - If a paragraph is a subheading/crosshead, translate it as a short Chinese heading.
-- For proper nouns that need context, retain the English original at first mention in parentheses so they can be annotated later.
+- At the first mention of every specific named person, organization, company, policy/law, event, place, work, publication, project, or acronym, retain its canonical English source spelling in parentheses after the Chinese translation. Do not omit the English spelling for famous or seemingly obvious names. Subsequent mentions need not repeat it.
 - Return JSON only. No Markdown fences, no explanations, no extra text.
-{f'''- Also return at most {glossary_max_terms} genuinely useful proper terms in glossary_terms. A term's surface must remain exactly visible in the specified Chinese paragraph. Use only: person, organization, company, policy_law, event, place_context, work, proper_concept, acronym. Each description_zh must contain 60-100 Chinese characters and must not invent facts.''' if glossary_enabled else ''}
 
 Title: {title}
 Section: {section}
@@ -1961,15 +2245,6 @@ Return JSON in this shape:
     {{
       "zh_text": "中文翻译",
       "role": "body"
-    }}
-  ],
-  "glossary_terms": [
-    {{
-      "term": "English proper term",
-      "term_zh": "中文名称",
-      "type": "organization",
-      "description_zh": "60-100字中文背景说明",
-      "occurrences": [{{"paragraph_index": 1, "surface": "中文段落中保留的英文原词", "occurrence": 1}}]
     }}
   ]
 }}
@@ -2016,13 +2291,10 @@ def compile_article_record(
         }
         return article
 
-    glossary_cfg = cfg["glossary"]
     prompt = _compile_article_prompt(
         title=title,
         section=section,
         paragraphs=source_paragraphs,
-        glossary_enabled=bool(glossary_cfg.get("enabled")),
-        glossary_max_terms=max(1, int(glossary_cfg.get("max_terms", 12))),
     )
     llm = cfg["llm"]
     max_tokens = max(int(llm.get("max_tokens", 2048)), 4096)
@@ -2075,14 +2347,7 @@ def compile_article_record(
                 "compiled_article": True,
                 "compile_status": "complete",
             }
-            if glossary_cfg.get("enabled"):
-                return _apply_glossary_terms(
-                    article,
-                    payload.get("glossary_terms") or payload.get("terms"),
-                    complete=True,
-                    max_terms=int(glossary_cfg["max_terms"]),
-                )
-            return _apply_glossary_terms(article, [], complete=False)
+            return enrich_article_glossary(client, cfg, article, log_)
         except Exception as exc:
             last_error = exc
             log_.warning(f"结构化编译失败 (attempt {attempt + 1}): {exc}")
@@ -2449,6 +2714,48 @@ def refresh_article_images(
             pass
 
 
+def refresh_article_glossary(
+    cfg: dict[str, Any], issue_date: str, article_ids: set[str],
+) -> list[dict[str, Any]]:
+    """按当前 glossary 规则回填已有中文译文，不重新抓取或翻译正文。"""
+    existing = read_database_js()
+    targets = [
+        article for article in existing
+        if article.get("issue_date") == issue_date
+        and (not article_ids or article.get("id") in article_ids)
+        and any(
+            isinstance(paragraph, dict) and str(paragraph.get("zh_text") or "").strip()
+            for paragraph in (article.get("paragraphs") or [])
+        )
+    ]
+    if not targets:
+        log.warning(f"没有找到含中文译文的待刷新文章: issue={issue_date}, ids={sorted(article_ids)}")
+        return []
+
+    client = make_llm_client(cfg)
+    refreshed: list[dict[str, Any]] = []
+    for article in targets:
+        try:
+            enrich_article_glossary(client, cfg, article, log)
+            refreshed.append(article)
+            write_database_js(existing)
+            log.info(
+                f"[glossary] 已刷新 {article.get('id')}: "
+                f"{len(article.get('glossary_entries') or [])} 个关键词, "
+                f"complete={article.get('glossary_analysis_complete')}"
+            )
+        except Exception as exc:
+            article["glossary_analysis_complete"] = False
+            article["glossary_version"] = 0
+            log.warning(f"[glossary] 刷新失败 {article.get('id')}: {exc}")
+
+    if refreshed:
+        write_database_js(existing)
+        _sync_paper_outputs(cfg, existing, issue_date=issue_date)
+        _maybe_rebuild_index(cfg)
+    return refreshed
+
+
 # ---------------------------------------------------------------------------
 # Cookie 导入(把别处已登录的 cookie 灌到本机 Chrome profile)
 # ---------------------------------------------------------------------------
@@ -2588,8 +2895,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=0, help="限制本次最多新增文章数(0=不限制)")
     p.add_argument("--refresh-images", action="store_true",
                    help="只重新抓取现有文章的正文图片并生成图片解析，不重抓正文")
+    p.add_argument("--refresh-glossary", action="store_true",
+                   help="只按当前规则重新解析现有文章的中文关键词，不重抓或重译正文")
     p.add_argument("--article-ids", default="",
-                   help="配合 --refresh-images 使用，逗号分隔的 article id；留空表示本期全部")
+                   help="配合 --refresh-images/--refresh-glossary，逗号分隔 article id；留空表示本期全部")
     p.add_argument("--no-feishu", action="store_true", help="不推飞书")
     p.add_argument("--rewrite-id", default=None, help="强制重写指定 id 的文章")
     p.add_argument("--single-url", default=None, metavar="URL",
@@ -2755,6 +3064,12 @@ def main() -> int:
         cfg_b = cfg["browser"]
         _cleanup_stale_chrome_locks(cfg_b["user_data_path"])
     issue_date = args.issue or datetime.now().strftime("%Y-%m-%d")
+    if args.refresh_glossary:
+        article_ids = {item.strip() for item in args.article_ids.split(",") if item.strip()}
+        log.info(f"=== 刷新关键词 issue={issue_date}, ids={sorted(article_ids) or 'all'} ===")
+        refresh_article_glossary(cfg, issue_date, article_ids)
+        log.info("=== 结束 ===")
+        return 0
     if args.refresh_images:
         article_ids = {item.strip() for item in args.article_ids.split(",") if item.strip()}
         log.info(f"=== 刷新图片 issue={issue_date}, ids={sorted(article_ids) or 'all'} ===")

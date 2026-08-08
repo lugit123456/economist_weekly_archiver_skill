@@ -5,7 +5,8 @@ description: |
   OpenAI-compatible LLM 生成中文解读、段落翻译、关键词解析和图片简析，下载正文图片，
   持久化到 database.js，并可选推送到 Feishu。支持 --limit 做小批量预览。
 
-  触发场景：用户想抓取《经济学人》某一期、补抓单篇文章、刷新已有文章图片，或导入本地 Cookie。
+  触发场景：用户想抓取《经济学人》某一期、补抓单篇文章、刷新已有文章图片或关键词，
+  或导入本地 Cookie。
 ---
 
 # Economist Weekly Archiver Skill
@@ -38,6 +39,10 @@ python sync_weekly.py --issue 2026-08-01 --no-feishu
 # 重新抓取已有文章图片并生成图片简析
 python sync_weekly.py --issue 2026-08-01 --refresh-images \
   --article-ids art_2026-08-01_007,art_2026-08-01_008 --no-feishu
+
+# 按当前规则重新解析已有中文译文中的关键词
+python sync_weekly.py --issue 2026-08-01 --refresh-glossary \
+  --article-ids art_2026-08-01_007,art_2026-08-01_008
 ```
 
 ## 输入与输出
@@ -55,8 +60,9 @@ python sync_weekly.py --issue 2026-08-01 --refresh-images \
 `Explore more` 之前；`weeklyEdition.cover`、`squareCover` 等周刊封面不会作为正文图片保存。
 每张图片可生成 50-80 个中文字符的 `image_insights`，说明图片、图表或漫画内容及其与文章的关系。
 
-浏览器访问始终串行；默认使用 2 个正文 LLM worker 和 1 个图片 LLM worker。正文请求会同时输出
-段落翻译、中文解读和关键词，图片解析完成后异步回填，不阻塞文章落库。可通过
+浏览器访问始终串行；默认使用 2 个正文 LLM worker 和 1 个图片 LLM worker。每篇文章先生成
+段落翻译和中文解读，再独立解析关键词；关键词解析会提取中文栏英文候选并对漏项补充请求。
+图片解析完成后异步回填，不阻塞文章落库。可通过
 `LLM_COMPILE_WORKERS`、`LLM_IMAGE_WORKERS` 和 `LLM_MAX_PENDING` 调整并发。
 
 每篇文章还可以产生：
@@ -75,7 +81,8 @@ python sync_weekly.py --issue 2026-08-01 --refresh-images \
 --dry-run                只列出候选链接，不抓正文、不写库
 --no-feishu              不推送 Feishu
 --refresh-images         只刷新已有文章图片和图片简析
---article-ids IDS        配合 --refresh-images，逗号分隔 article id
+--refresh-glossary       只重新解析已有中文译文的关键词
+--article-ids IDS        配合刷新命令，逗号分隔 article id
 --single-url URL         只抓指定 URL 一篇
 --section NAME           配合 --single-url 指定板块
 --rewrite-id ID          强制重写指定文章
@@ -106,7 +113,7 @@ LLM_ANALYZE_ARTICLE_IMAGES=true
 
 - 不要提交 `.env`、Cookie、`database.js`、`output_results/` 或含付费原文的导出目录。
 - `economist_cookies.json` 是登录凭据，不要发送到聊天、工单或公开仓库。
-- 本项目当前只完成代码、静态检查和本地运行验证；仓库中已删除测试代码，不要在文档中声称有测试数量。
+- 修改 glossary 逻辑后运行 `python -m unittest discover -s tests -v` 和静态语法检查。
 
 ## 参考
 

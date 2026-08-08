@@ -13,7 +13,8 @@
 - 图片范围截止到页面 `Explore more` 之前，排除周刊封面等推荐区图片。
 - 图片下载到 `output_results/TE/{issue_date}/images/`，并生成 50-80 个中文字符的简短解析。
 - 每期封面使用 weekly edition 顶部的 `content.cover` 图片，保存为 `output_results/TE/{issue_date}/cover.jpg`。
-- 关键词解析生成 `glossary_entries` 和 `term_annotations`，用于前端定位和展示。
+- 关键词独立解析生成 `glossary_entries` 和 `term_annotations`；先从中文译文确定性提取英文专名，
+  再由 LLM 生成背景解释，漏项会自动补充解析。
 - 浏览器抓取保持串行；正文编译和图片解析使用独立 LLM 队列并行执行。
 - URL 去重、逐篇写盘、可选英文 Markdown 导出、可选 Feishu 通知。
 
@@ -35,6 +36,7 @@ economist_weekly_archiver_skill/
 ├── database.js                    # 本地数据文件，建议不要公开
 ├── .env.example                   # 配置模板
 ├── requirements.txt
+├── tests/test_glossary.py         # 关键词抽取、补漏和定位回归测试
 ├── run_weekly_sync.sh             # 可选的本地定时任务包装脚本
 ├── install_launchd.sh             # 可选的 macOS launchd 安装脚本
 ├── launchd/                       # 可选定时配置
@@ -82,12 +84,16 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 |---|---|---|
 | `LLM_GLOSSARY_ENABLED` | 是否开启关键词解析 | `true` |
 | `LLM_GLOSSARY_MODEL` 或 `OPENAI_GLOSSARY_MODEL` | 关键词解析模型，留空沿用 `LLM_MODEL` | 空 |
-| `LLM_GLOSSARY_MAX_TERMS` | 每篇最多关键词数量 | `12` |
+| `LLM_GLOSSARY_MAX_TERMS` | 每篇最多关键词数量 | `32` |
+| `LLM_GLOSSARY_MAX_ZH_CANDIDATES` | 中文译文中英文专名候选上限 | `32` |
+| `LLM_GLOSSARY_MAX_INPUT_CHARS` | glossary 请求最多输入的中英文字符数 | `24000` |
 | `LLM_GLOSSARY_MAX_TOKENS` | 关键词请求最大 token 数 | `5000` |
 | `LLM_GLOSSARY_MAX_RETRIES` | 关键词解析重试次数 | `2` |
 
-关键词类型包括人物、组织、公司、法律/政策、事件、地点、作品、专有概念和缩写。只有能在中文
-段落中定位到的术语才会写入 `term_annotations`。
+关键词类型包括人物、组织、公司、法律/政策、事件、地点、作品、专有概念和缩写。翻译阶段会在
+首次出现时保留专名的英文原文；glossary 阶段会逐项审查中文栏中的英文候选。只有能在中文段落
+中实际定位到的术语才会写入 `term_annotations`。模型给错大小写或段落号时，代码会回查真实位置；
+若首次响应漏掉候选，则会额外发起一次仅处理漏项的请求。仍有漏项或请求失败时不会误标为完成。
 
 ### 图片解析
 
@@ -106,13 +112,13 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 
 | 环境变量 | 说明 | 默认值 |
 |---|---|---|
-| `LLM_COMPILE_WORKERS` | 正文翻译、解读和关键词合并请求的并发数 | `2` |
+| `LLM_COMPILE_WORKERS` | 正文翻译、解读及后续关键词请求的并发文章数 | `2` |
 | `LLM_IMAGE_WORKERS` | 图片 vision 解析并发数 | `1` |
 | `LLM_MAX_PENDING` | 等待正文编译的最大文章数 | `4` |
 
-正文结构化结果会同时返回关键词，正常路径不再追加 glossary 请求。文章一完成正文编译即写入
-`database.js`；图片解析在独立队列完成后再回填。遇到 `422`、认证或参数错误不会重复重试，
-只会重试超时、连接错误、`429` 和服务端错误。
+每篇文章先完成正文结构化翻译，再执行独立 glossary 请求，避免复杂的合并响应漏掉专名。
+文章完成正文和关键词处理后写入 `database.js`；图片解析在独立队列完成后再回填。遇到 `422`、
+认证或参数错误不会重复重试，只会重试超时、连接错误、`429` 和服务端错误。
 
 ### 浏览器、输出与通知
 
@@ -146,6 +152,10 @@ python sync_weekly.py --issue 2026-08-01 --dry-run --no-feishu
 python sync_weekly.py --issue 2026-08-01 --refresh-images \
   --article-ids art_2026-08-01_007,art_2026-08-01_008 --no-feishu
 
+# 按新版规则回填已有中文译文的关键词；省略 --article-ids 则处理本期全部
+python sync_weekly.py --issue 2026-08-01 --refresh-glossary \
+  --article-ids art_2026-08-01_007,art_2026-08-01_008
+
 # 单篇调试、重写和维护
 python sync_weekly.py --single-url '<URL>' --section 'Briefing' --no-feishu
 python sync_weekly.py --rewrite-id art_2026-08-01_007 --no-feishu
@@ -164,7 +174,8 @@ python sync_weekly.py --kill-stale
 --dry-run                 只列候选 URL
 --no-feishu               不推送 Feishu
 --refresh-images          刷新图片和图片解析
---article-ids IDS         刷新指定 article id，逗号分隔
+--refresh-glossary        重新解析已有中文译文的关键词
+--article-ids IDS         配合刷新命令指定 article id，逗号分隔
 --single-url URL          单篇抓取
 --section NAME            单篇抓取时指定板块
 --rewrite-id ID           强制重写已有文章
