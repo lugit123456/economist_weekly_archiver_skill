@@ -71,7 +71,7 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 |---|---|---|
 | `LLM_API_KEY` | LLM API key | 空，必须填写 |
 | `LLM_BASE_URL` | OpenAI-compatible API 地址 | 官方 API |
-| `LLM_MODEL` | 文章中文解读和翻译模型 | `gpt-4o-mini` |
+| `LLM_MODEL` | 文章中文解读和逐段翻译模型 | `gpt-4o-mini` |
 | `LLM_MAX_TOKENS` | 文章请求最大 token 数 | `2048` |
 | `LLM_TEMPERATURE` | 文章请求 temperature | `0.4` |
 | `LLM_TIMEOUT_S` | LLM 请求超时秒数 | `60` |
@@ -116,7 +116,9 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 | `LLM_IMAGE_WORKERS` | 图片 vision 解析并发数 | `1` |
 | `LLM_MAX_PENDING` | 等待正文编译的最大文章数 | `4` |
 
-每篇文章先完成正文结构化翻译，再执行独立 glossary 请求，避免复杂的合并响应漏掉专名。
+每篇文章使用两个独立请求分别完成逐段翻译和中文解读，再执行 glossary 请求。翻译请求负责段落
+对齐和专名英文原文，解读请求按中文读者的阅读习惯重新组织论点。普通文章的解读为 420-650 个
+汉字；中长文章放宽至 520-800 个汉字，超长文章放宽至 620-1000 个汉字。
 文章完成正文和关键词处理后写入 `database.js`；图片解析在独立队列完成后再回填。遇到 `422`、
 认证或参数错误不会重复重试，只会重试超时、连接错误、`429` 和服务端错误。
 
@@ -193,7 +195,7 @@ python sync_weekly.py --kill-stale
 |---|---|
 | `issue_date` / `id` | 期刊日期和稳定文章 ID |
 | `section` / `title` / `url` | 板块、英文标题和原文地址 |
-| `title_zh` / `summary_md` | 中文标题和约 400-500 字中文解读 |
+| `title_zh` / `summary_md` | 中文标题和按原文体量生成的多段中文解读 |
 | `content_raw` / `paragraphs` | 英文原文和逐段中英内容 |
 | `images` | 本地图片相对路径或下载失败时的远程 URL |
 | `image_insights` | 图片类型和 50-80 字中文解析 |
