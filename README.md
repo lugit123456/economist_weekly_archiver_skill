@@ -71,7 +71,7 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 |---|---|---|
 | `LLM_API_KEY` | LLM API key | 空，必须填写 |
 | `LLM_BASE_URL` | OpenAI-compatible API 地址 | 官方 API |
-| `LLM_MODEL` | 文章中文解读和翻译模型 | `gpt-4o-mini` |
+| `LLM_MODEL` | 文章中文解读和逐段翻译模型 | `gpt-4o-mini` |
 | `LLM_MAX_TOKENS` | 文章请求最大 token 数 | `2048` |
 | `LLM_TEMPERATURE` | 文章请求 temperature | `0.4` |
 | `LLM_TIMEOUT_S` | LLM 请求超时秒数 | `60` |
@@ -90,8 +90,9 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 | `LLM_GLOSSARY_MAX_TOKENS` | 关键词请求最大 token 数 | `5000` |
 | `LLM_GLOSSARY_MAX_RETRIES` | 关键词解析重试次数 | `2` |
 
-关键词类型包括人物、组织、公司、法律/政策、事件、地点、作品、专有概念和缩写。翻译阶段会在
-首次出现时保留专名的英文原文；glossary 阶段会逐项审查中文栏中的英文候选。只有能在中文段落
+关键词类型包括人物、组织、公司、法律/政策、事件、地点、作品、专有概念和缩写。翻译和中文解读
+会始终保留人名、公司、品牌、平台、网站、app、产品和服务的英文原名，不翻译、音译或改用中文
+别名；其他专名会在首次出现时保留英文原文。glossary 阶段会逐项审查中文栏中的英文候选。只有能在中文段落
 中实际定位到的术语才会写入 `term_annotations`。模型给错大小写或段落号时，代码会回查真实位置；
 若首次响应漏掉候选，则会额外发起一次仅处理漏项的请求。仍有漏项或请求失败时不会误标为完成。
 
@@ -116,7 +117,9 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 | `LLM_IMAGE_WORKERS` | 图片 vision 解析并发数 | `1` |
 | `LLM_MAX_PENDING` | 等待正文编译的最大文章数 | `4` |
 
-每篇文章先完成正文结构化翻译，再执行独立 glossary 请求，避免复杂的合并响应漏掉专名。
+每篇文章使用两个独立请求分别完成逐段翻译和中文解读，再执行 glossary 请求。翻译请求负责段落
+对齐和专名英文原文，解读请求按中文读者的阅读习惯重新组织论点。普通文章的解读为 420-650 个
+汉字；中长文章放宽至 520-800 个汉字，超长文章放宽至 620-1000 个汉字。
 文章完成正文和关键词处理后写入 `database.js`；图片解析在独立队列完成后再回填。遇到 `422`、
 认证或参数错误不会重复重试，只会重试超时、连接错误、`429` 和服务端错误。
 
@@ -193,7 +196,7 @@ python sync_weekly.py --kill-stale
 |---|---|
 | `issue_date` / `id` | 期刊日期和稳定文章 ID |
 | `section` / `title` / `url` | 板块、英文标题和原文地址 |
-| `title_zh` / `summary_md` | 中文标题和约 400-500 字中文解读 |
+| `title_zh` / `summary_md` | 中文标题和按原文体量生成的多段中文解读 |
 | `content_raw` / `paragraphs` | 英文原文和逐段中英内容 |
 | `images` | 本地图片相对路径或下载失败时的远程 URL |
 | `image_insights` | 图片类型和 50-80 字中文解析 |

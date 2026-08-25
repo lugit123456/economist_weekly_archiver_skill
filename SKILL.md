@@ -60,14 +60,14 @@ python sync_weekly.py --issue 2026-08-01 --refresh-glossary \
 `Explore more` 之前；`weeklyEdition.cover`、`squareCover` 等周刊封面不会作为正文图片保存。
 每张图片可生成 50-80 个中文字符的 `image_insights`，说明图片、图表或漫画内容及其与文章的关系。
 
-浏览器访问始终串行；默认使用 2 个正文 LLM worker 和 1 个图片 LLM worker。每篇文章先生成
+浏览器访问始终串行；默认使用 2 个正文 LLM worker 和 1 个图片 LLM worker。每篇文章分别请求
 段落翻译和中文解读，再独立解析关键词；关键词解析会提取中文栏英文候选并对漏项补充请求。
 图片解析完成后异步回填，不阻塞文章落库。可通过
 `LLM_COMPILE_WORKERS`、`LLM_IMAGE_WORKERS` 和 `LLM_MAX_PENDING` 调整并发。
 
 每篇文章还可以产生：
 
-- `summary_md`：约 400-500 个中文字符的连贯中文解读。
+- `summary_md`：按原文体量生成 420-1000 个汉字、分成自然段的连贯中文解读。
 - `paragraphs`：按原文段落保存英文和中文内容。
 - `glossary_entries`：关键词、中文名称、类型和中文背景说明。
 - `term_annotations`：关键词在中文段落中的定位信息。

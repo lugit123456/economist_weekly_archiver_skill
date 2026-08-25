@@ -1714,6 +1714,10 @@ def count_cn_chars(s: str) -> int:
     return len(CN_CHAR_RE.findall(s))
 
 
+class LLMOutputValidationError(ValueError):
+    """LLM 返回了可解析但不符合文章输出约束的内容。"""
+
+
 def _split_article_paragraphs(body: str) -> list[dict[str, str]]:
     """把文章正文拆成可翻译段落,保留 crosshead / 普通段落的角色信息。"""
     paragraphs: list[dict[str, str]] = []
@@ -1771,10 +1775,12 @@ def _should_retry_llm_error(exc: Exception, attempt: int, max_retries: int) -> b
         return status_code in {408, 409, 425, 429} or status_code >= 500
     if isinstance(exc, json.JSONDecodeError):
         return attempt == 0
+    if isinstance(exc, LLMOutputValidationError):
+        return True
     message = str(exc).lower()
     if "connection" in message or "timed out" in message or "timeout" in message:
         return True
-    return "中文解读字数不合格" in str(exc) and attempt == 0
+    return False
 
 
 def _normalise_compiled_paragraphs(
@@ -1790,7 +1796,7 @@ def _normalise_compiled_paragraphs(
         if not isinstance(raw_item, dict):
             raw_item = {}
         zh_text = str(raw_item.get("zh_text") or raw_item.get("translation") or "").strip()
-        role = str(raw_item.get("role") or source.get("role") or "body").strip() or "body"
+        role = str(source.get("role") or "body").strip() or "body"
         translated.append(
             {
                 "para_id": str(raw_item.get("para_id") or f"{article_id}_p{index}"),
@@ -2204,51 +2210,249 @@ def enrich_article_glossary(
     return article
 
 
-def _compile_article_prompt(
+def _render_article_prompt_paragraphs(paragraphs: list[dict[str, str]]) -> str:
+    rendered = []
+    for index, paragraph in enumerate(paragraphs, start=1):
+        role = paragraph.get("role") or "body"
+        text = str(paragraph.get("en_text") or "").strip()
+        if text:
+            rendered.append(f"{index}. [{role}] {text}")
+    return "\n".join(rendered)
+
+
+def _translation_prompt(
     title: str,
     section: str,
     paragraphs: list[dict[str, str]],
 ) -> str:
-    paragraph_lines = []
-    for index, paragraph in enumerate(paragraphs, start=1):
-        role = paragraph.get("role") or "body"
-        text = str(paragraph.get("en_text") or "").strip()
-        if not text:
-            continue
-        paragraph_lines.append(f"{index}. [{role}] {text}")
+    return f"""你是一名资深英中新闻编辑。请逐段翻译下面的《经济学人》文章，只返回严格 JSON。
 
-    return f"""You are a meticulous English-Chinese editor for The Economist.
-
-Translate and structure the following article into STRICT JSON only.
-
-Rules:
-- Keep the meaning faithful and do not add facts.
-- title_zh must be a concise, natural Chinese title.
-- summary_md must be a cohesive, flowing Chinese analysis of 500-550 Chinese Han characters, never exceeding 600 Chinese Han characters. Naturally integrate the core message, key arguments, supporting evidence, and potential implications. Use professional prose for a knowledgeable Chinese reader. Do not use bullet points, numbered lists, or section headers. Before returning the JSON, silently count the Chinese Han characters in summary_md and expand it when the count is below 500; do not include the count in the output.
-- Translate every paragraph semantically and naturally, not word-for-word.
-- Preserve the paragraph order and count exactly.
-- If a paragraph is a subheading/crosshead, translate it as a short Chinese heading.
-- At the first mention of every specific named person, organization, company, policy/law, event, place, work, publication, project, or acronym, retain its canonical English source spelling in parentheses after the Chinese translation. Do not omit the English spelling for famous or seemingly obvious names. Subsequent mentions need not repeat it.
-- Return JSON only. No Markdown fences, no explanations, no extra text.
+翻译要求：
+1. 忠实保留原意、事实、数字、立场和语气，不增添原文之外的信息。
+2. 使用自然、清楚的现代中文，不逐词照搬英文语序。主动拆开过长的英文句子，补足中文所需的主语和逻辑连接，使每句话都能独立读懂。
+3. 根据上下文意译习语、隐喻和抽象表达，避免“降低杠杆”“使其过时”一类脱离中文语境的机械直译。
+4. 保持段落顺序和数量完全一致，每个输入段落必须有且只有一个对应译文，不得合并、拆分或遗漏。
+5. crosshead 译成简短自然的中文小标题；body 译成正文。
+6. 人名，以及公司、品牌、平台、网站、app、产品和服务的英文专名，始终直接保留原文英文拼写，不翻译、不音译，也不改用中文别名；不要写成“中文名（English）”。例如 Google、Reddit、Instagram、TikTok、Sensor Tower 和 AI Overviews 均须原样保留。
+7. 对上述类别之外的具体组织、政策或法律、事件、地点、作品、出版物、项目及缩写，第一次出现时可在中文名称后用全角括号保留规范英文原文；后续不必重复。“海湾国家（Gulf states）”这类泛称不是专名，不要添加英文括注。
+8. Mr、Mrs、Ms、Dr 等英文称谓通常省略，只保留英文人名，不机械写成“先生”“女士”或“博士”；只有称谓本身影响语义时才保留。
+9. 不写摘要、评论、说明或 Markdown 代码块。
 
 Title: {title}
 Section: {section}
 
 Source paragraphs:
-{chr(10).join(paragraph_lines)}
+{_render_article_prompt_paragraphs(paragraphs)}
 
 Return JSON in this shape:
 {{
-  "title_zh": "中文标题",
-  "summary_md": "完整、连贯的长篇中文解读",
   "paragraphs": [
     {{
-      "zh_text": "中文翻译",
+      "zh_text": "自然、完整的中文译文",
       "role": "body"
     }}
   ]
 }}
 """
+
+
+def _source_word_count(paragraphs: list[dict[str, str]]) -> int:
+    return sum(
+        len(re.findall(r"\b[\w’'-]+\b", str(paragraph.get("en_text") or "")))
+        for paragraph in paragraphs
+    )
+
+
+def _summary_length_bounds(paragraphs: list[dict[str, str]]) -> tuple[int, int]:
+    """按英文正文体量给中文解读留出空间，避免短文灌水、长文硬压缩。"""
+    source_words = _source_word_count(paragraphs)
+    if source_words <= 900:
+        return 420, 650
+    if source_words <= 1800:
+        return 520, 800
+    return 620, 1000
+
+
+def _summary_prompt(
+    title: str,
+    section: str,
+    paragraphs: list[dict[str, str]],
+    min_cn_chars: int,
+    max_cn_chars: int,
+) -> str:
+    return f"""你是一名面向中文读者的资深国际政经编辑。请基于下面的《经济学人》英文原文，重新撰写中文标题和中文解读。只返回严格 JSON。
+
+这不是逐段翻译，也不是把原文每段压缩后依次拼接。你需要先理解文章真正要回答的问题，再按中文读者最容易理解的顺序重组材料。
+
+中文解读要求：
+1. 开头直接讲清文章的核心判断及其现实背景；随后解释关键原因和证据；最后交代作者主张、局限或影响。主次分明，不追求覆盖所有细枝末节。
+2. 写成 3-5 个自然段，不使用小标题、项目符号或编号。每段只承担一个主要作用，段落之间要有自然的因果、转折或递进关系。
+3. 使用像中文原创评论稿一样顺畅、克制的表达。明确句子主语，优先使用短句和中等长度句；多数句子控制在 20-45 个汉字，超过 70 个汉字时应主动拆句。
+4. 避免欧化句式、连续堆叠分号、名词串联和生硬直译。根据语境把 leverage、workaround、make obsolete 等表达转写成中文读者能直接理解的具体意思，不照搬英文词形。
+5. 关键数字和事实只选择真正支撑核心判断的内容。不得为了凑字数罗列信息、重复结论或加入原文没有的背景知识。
+6. 对争议性判断明确归属于文章、相关国家或相关人物，不把观点写成未经限定的事实。
+7. summary_md 使用 {min_cn_chars}-{max_cn_chars} 个汉字。文章较长时已经放宽上限，应利用额外篇幅讲清逻辑，而不是让句子变得更长。返回前自行检查，但不要输出字数。
+8. title_zh 应简洁、自然、准确，避免逐词翻译造成歧义。政治和外交语境中的 deal 通常译为“协议”或“安排”，不要写成“交易”“谈一笔交易”等商业化表达。
+9. title_zh 和 summary_md 中出现的人名，以及公司、品牌、平台、网站、app、产品和服务的英文专名，始终直接保留原文英文拼写，不翻译、不音译，也不改用中文别名。例如 Google、Reddit、Instagram、TikTok、Sensor Tower 和 AI Overviews 均须原样保留。
+
+Title: {title}
+Section: {section}
+
+Source paragraphs:
+{_render_article_prompt_paragraphs(paragraphs)}
+
+Return JSON in this shape:
+{{
+  "title_zh": "自然准确的中文标题",
+  "summary_md": "分成3-5个自然段的连贯中文解读"
+}}
+"""
+
+
+def _validate_summary_style(summary: str) -> None:
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", summary) if part.strip()]
+    if not 2 <= len(paragraphs) <= 6:
+        raise LLMOutputValidationError(
+            f"中文解读段落不合格({len(paragraphs)}，要求 2-6 个自然段)"
+        )
+    if any(re.match(r"^(?:#{1,6}\s|[-*+]\s|\d+[.、)]\s*)", part) for part in paragraphs):
+        raise LLMOutputValidationError("中文解读不得使用标题、项目符号或编号")
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"[。！？!?]+", summary)
+        if sentence.strip()
+    ]
+    longest = max((count_cn_chars(sentence) for sentence in sentences), default=0)
+    if longest > 90:
+        raise LLMOutputValidationError(
+            f"中文解读存在过长句子({longest} 个汉字，单句不得超过 90 个汉字)"
+        )
+
+
+def _request_article_translation(
+    client: Any,
+    cfg: dict[str, Any],
+    *,
+    title: str,
+    section: str,
+    source_paragraphs: list[dict[str, str]],
+    article_id: str,
+    log_: logging.Logger,
+) -> list[dict[str, str]]:
+    llm = cfg["llm"]
+    prompt = _translation_prompt(title, section, source_paragraphs)
+    max_retries = int(cfg["crawl"].get("max_retries", 2))
+    source_words = _source_word_count(source_paragraphs)
+    translation_token_floor = 8192 if source_words > 1800 else 4096
+    max_tokens = max(int(llm.get("max_tokens", 2048)), translation_token_floor)
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=llm.get("model", "gpt-4o-mini"),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "只返回 JSON。忠实翻译全文，但必须使用自然、清楚的现代中文，"
+                            "不得逐词照搬英文句法。"
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=max_tokens,
+                temperature=min(float(llm.get("temperature", 0.4)), 0.2),
+                response_format={"type": "json_object"},
+            )
+            payload = _extract_json_payload(response.choices[0].message.content or "")
+            raw_paragraphs = payload.get("paragraphs")
+            if not isinstance(raw_paragraphs, list) or len(raw_paragraphs) != len(source_paragraphs):
+                actual = len(raw_paragraphs) if isinstance(raw_paragraphs, list) else 0
+                raise LLMOutputValidationError(
+                    f"段落翻译数量不合格({actual}，要求 {len(source_paragraphs)})"
+                )
+            translated = _normalise_compiled_paragraphs(
+                source_paragraphs, raw_paragraphs, article_id,
+            )
+            missing = [
+                index
+                for index, paragraph in enumerate(translated, start=1)
+                if not str(paragraph.get("zh_text") or "").strip()
+            ]
+            if missing:
+                raise LLMOutputValidationError(
+                    "段落翻译存在空译文: " + ", ".join(map(str, missing[:10]))
+                )
+            return translated
+        except Exception as exc:
+            last_error = exc
+            log_.warning(f"逐段翻译失败 (attempt {attempt + 1}): {exc}")
+            if not _should_retry_llm_error(exc, attempt, max_retries):
+                break
+            time.sleep(1.0)
+
+    raise last_error or RuntimeError("逐段翻译失败")
+
+
+def _request_article_summary(
+    client: Any,
+    cfg: dict[str, Any],
+    *,
+    title: str,
+    section: str,
+    source_paragraphs: list[dict[str, str]],
+    log_: logging.Logger,
+) -> tuple[str, str]:
+    llm = cfg["llm"]
+    min_cn_chars, max_cn_chars = _summary_length_bounds(source_paragraphs)
+    prompt = _summary_prompt(
+        title, section, source_paragraphs, min_cn_chars, max_cn_chars,
+    )
+    max_retries = int(cfg["crawl"].get("max_retries", 2))
+    max_tokens = max(int(llm.get("max_tokens", 2048)), 2048, max_cn_chars * 3)
+    temperature = min(max(float(llm.get("temperature", 0.4)), 0.3), 0.6)
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=llm.get("model", "gpt-4o-mini"),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "只返回 JSON。你是在为中文读者撰写原创编辑稿，不是逐段翻译或"
+                            "英文摘要的直译；表达必须自然、清楚、符合中文阅读习惯。"
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                response_format={"type": "json_object"},
+            )
+            payload = _extract_json_payload(response.choices[0].message.content or "")
+            title_zh = str(payload.get("title_zh") or "").strip()
+            summary_md = str(payload.get("summary_md") or "").strip()
+            if not title_zh or not summary_md:
+                raise LLMOutputValidationError("中文解读缺少 title_zh 或 summary_md")
+            summary_cn_chars = count_cn_chars(summary_md)
+            if not min_cn_chars <= summary_cn_chars <= max_cn_chars:
+                raise LLMOutputValidationError(
+                    f"中文解读字数不合格({summary_cn_chars}，要求 "
+                    f"{min_cn_chars}-{max_cn_chars} 个汉字)"
+                )
+            _validate_summary_style(summary_md)
+            return title_zh, summary_md
+        except Exception as exc:
+            last_error = exc
+            log_.warning(f"中文解读失败 (attempt {attempt + 1}): {exc}")
+            if not _should_retry_llm_error(exc, attempt, max_retries):
+                break
+            time.sleep(1.0)
+
+    raise last_error or RuntimeError("中文解读失败")
 
 
 def compile_article_record(
@@ -2291,96 +2495,63 @@ def compile_article_record(
         }
         return article
 
-    prompt = _compile_article_prompt(
-        title=title,
-        section=section,
-        paragraphs=source_paragraphs,
-    )
-    llm = cfg["llm"]
-    max_tokens = max(int(llm.get("max_tokens", 2048)), 4096)
+    translation_error: Exception | None = None
+    summary_error: Exception | None = None
 
-    last_error: Exception | None = None
-    for attempt in range(int(cfg["crawl"].get("max_retries", 2)) + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=llm.get("model", "gpt-4o-mini"),
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Return JSON only. Translate The Economist articles into faithful Chinese.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=max_tokens,
-                temperature=0.2,
-                response_format={"type": "json_object"},
-            )
-            payload = _extract_json_payload(resp.choices[0].message.content or "")
-            title_zh = str(payload.get("title_zh") or "").strip()
-            summary_md = str(payload.get("summary_md") or "").strip()
-            compiled_paragraphs = _normalise_compiled_paragraphs(
-                source_paragraphs,
-                payload.get("paragraphs"),
-                article_id,
-            )
-            if not title_zh or not summary_md:
-                raise ValueError("LLM 结构化输出缺少 title_zh 或 summary_md")
-            summary_cn_chars = count_cn_chars(summary_md)
-            if not 400 <= summary_cn_chars <= 600:
-                raise ValueError(
-                    f"中文解读字数不合格({summary_cn_chars}，要求 400-600 中文字符)"
-                )
-
-            article = {
-                "id": article_id,
-                "issue_date": issue_date,
-                "section": section,
-                "title": title,
-                "title_zh": title_zh,
-                "url": url,
-                "summary_md": summary_md,
-                "content_raw": _format_source_content_markdown(source_paragraphs),
-                "content_markdown": _format_source_content_markdown(source_paragraphs),
-                "paragraphs": compiled_paragraphs,
-                "images": images or [],
-                "image_insights": [],
-                "compiled_article": True,
-                "compile_status": "complete",
+    try:
+        compiled_paragraphs = _request_article_translation(
+            client,
+            cfg,
+            title=title,
+            section=section,
+            source_paragraphs=source_paragraphs,
+            article_id=article_id,
+            log_=log_,
+        )
+    except Exception as exc:
+        translation_error = exc
+        log_.error(f"逐段翻译最终失败: {title} ({exc})")
+        compiled_paragraphs = [
+            {
+                "para_id": f"{article_id}_p{index}",
+                "en_text": str(paragraph.get("en_text") or ""),
+                "zh_text": "",
+                "role": str(paragraph.get("role") or "body"),
             }
-            return enrich_article_glossary(client, cfg, article, log_)
-        except Exception as exc:
-            last_error = exc
-            log_.warning(f"结构化编译失败 (attempt {attempt + 1}): {exc}")
-            if not _should_retry_llm_error(exc, attempt, int(cfg["crawl"].get("max_retries", 2))):
-                break
-            time.sleep(1.0)
+            for index, paragraph in enumerate(source_paragraphs, start=1)
+        ]
 
-    log_.warning(f"结构化编译失败,回退到仅摘要模式: {title} ({last_error})")
-    summary = summarize(client, cfg, title, body, log_)
-    fallback_paragraphs = [
-        {
-            "para_id": f"{article_id}_p{index}",
-            "en_text": str(paragraph.get("en_text") or ""),
-            "zh_text": "",
-            "role": str(paragraph.get("role") or "body"),
-        }
-        for index, paragraph in enumerate(source_paragraphs, start=1)
-    ]
+    try:
+        title_zh, summary_md = _request_article_summary(
+            client,
+            cfg,
+            title=title,
+            section=section,
+            source_paragraphs=source_paragraphs,
+            log_=log_,
+        )
+    except Exception as exc:
+        summary_error = exc
+        log_.error(f"中文解读最终失败，启用兼容摘要兜底: {title} ({exc})")
+        title_zh = ""
+        summary_md = summarize(client, cfg, title, body, log_)
+
+    compile_complete = translation_error is None and summary_error is None
     article = {
         "id": article_id,
         "issue_date": issue_date,
         "section": section,
         "title": title,
-        "title_zh": "",
+        "title_zh": title_zh,
         "url": url,
-        "summary_md": summary,
+        "summary_md": summary_md,
         "content_raw": _format_source_content_markdown(source_paragraphs),
         "content_markdown": _format_source_content_markdown(source_paragraphs),
-        "paragraphs": fallback_paragraphs,
+        "paragraphs": compiled_paragraphs,
         "images": images or [],
         "image_insights": [],
-        "compiled_article": False,
-        "compile_status": "fallback",
+        "compiled_article": compile_complete,
+        "compile_status": "complete" if compile_complete else "fallback",
     }
     return enrich_article_glossary(client, cfg, article, log_)
 
