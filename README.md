@@ -199,6 +199,7 @@ python sync_weekly.py --kill-stale
 | `title_zh` / `summary_md` | 中文标题和按原文体量生成的多段中文解读 |
 | `content_raw` / `paragraphs` | 英文原文和逐段中英内容 |
 | `images` | 本地图片相对路径或下载失败时的远程 URL |
+| `image_placements` | 图片在双语正文中的位置，`after_paragraph` 表示显示在第几段之后 |
 | `image_insights` | 图片类型和 50-80 字中文解析 |
 | `glossary_entries` | 关键词及中文背景说明 |
 | `term_annotations` | 关键词在中文段落中的定位 |

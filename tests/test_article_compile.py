@@ -8,8 +8,10 @@ from unittest.mock import patch
 
 from sync_weekly import (
     DEFAULTS,
+    _parse_next_article_content,
     _summary_length_bounds,
     compile_article_record,
+    materialize_image_placements,
 )
 
 
@@ -45,7 +47,7 @@ def _client(payloads: list[dict[str, object]]) -> tuple[SimpleNamespace, _FakeCo
 
 
 class ArticleCompileTests(unittest.TestCase):
-    def test_translation_and_summary_use_separate_requests_without_schema_changes(self) -> None:
+    def test_translation_and_summary_use_separate_requests(self) -> None:
         summary = _natural_summary()
         client, completions = _client([
             {
@@ -68,6 +70,7 @@ class ArticleCompileTests(unittest.TestCase):
             article_id="art_test_001",
             log_=logging.getLogger("test"),
             images=["images/example.jpg"],
+            image_placements=[{"path": "images/example.jpg", "after_paragraph": 1}],
         )
 
         self.assertIsNotNone(article)
@@ -89,6 +92,10 @@ class ArticleCompileTests(unittest.TestCase):
         self.assertEqual(article["title_zh"], "自然中文标题")
         self.assertEqual(article["summary_md"], summary)
         self.assertEqual([item["role"] for item in article["paragraphs"]], ["body", "body"])
+        self.assertEqual(
+            article["image_placements"],
+            [{"path": "images/example.jpg", "after_paragraph": 1}],
+        )
         self.assertTrue(article["compiled_article"])
         self.assertEqual(article["compile_status"], "complete")
         self.assertEqual(
@@ -96,10 +103,55 @@ class ArticleCompileTests(unittest.TestCase):
             {
                 "id", "issue_date", "section", "title", "title_zh", "url",
                 "summary_md", "content_raw", "content_markdown", "paragraphs",
-                "images", "image_insights", "compiled_article", "compile_status",
+                "images", "image_placements", "image_insights", "compiled_article", "compile_status",
                 "glossary_entries", "term_annotations", "glossary_analysis_complete",
                 "glossary_version",
             },
+        )
+
+    def test_next_data_images_keep_their_paragraph_positions(self) -> None:
+        lead_url = "https://www.economist.com/content-assets/images/lead.jpg"
+        chart_url = "https://www.economist.com/content-assets/images/chart.png"
+        title, body, image_urls, placements = _parse_next_article_content({
+            "headline": "Positioned images",
+            "leadComponent": {"url": lead_url},
+            "body": [
+                {"type": "PARAGRAPH", "text": "First paragraph."},
+                {"type": "PARAGRAPH", "text": "Second paragraph."},
+                {"type": "IMAGE", "url": chart_url},
+                {"type": "CROSSHEAD", "text": "What comes next"},
+                {"type": "PARAGRAPH", "text": "Third paragraph."},
+            ],
+        })
+
+        self.assertEqual(title, "Positioned images")
+        self.assertEqual(
+            body,
+            "First paragraph.\n\nSecond paragraph.\n\n\n## What comes next\n\n\nThird paragraph.",
+        )
+        self.assertEqual(image_urls, [lead_url, chart_url])
+        self.assertEqual(placements, [
+            {"url": lead_url, "after_paragraph": 0},
+            {"url": chart_url, "after_paragraph": 2},
+        ])
+
+    def test_materialized_image_paths_preserve_positions(self) -> None:
+        image_urls = ["https://example.com/lead.jpg", "https://example.com/chart.png"]
+        placements = [
+            {"url": image_urls[0], "after_paragraph": 0},
+            {"url": image_urls[1], "after_paragraph": 2},
+        ]
+
+        self.assertEqual(
+            materialize_image_placements(
+                image_urls,
+                ["images/article_01.jpg", "images/article_02.png"],
+                placements,
+            ),
+            [
+                {"path": "images/article_01.jpg", "after_paragraph": 0},
+                {"path": "images/article_02.png", "after_paragraph": 2},
+            ],
         )
 
     def test_translation_validation_retries_without_repeating_summary(self) -> None:
