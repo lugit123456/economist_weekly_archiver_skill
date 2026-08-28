@@ -116,5 +116,29 @@ else
   fi
 fi
 
+# ---- 5. 刷新共享本地静态站点(供 paper-vault-bv Web server 使用) ----
+AUTO_PUBLISH_AFTER_SYNC=${AUTO_PUBLISH_AFTER_SYNC:-1}
+PUBLISHER_DIR=${PAPER_PUBLISHER_DIR:-"$PROJECT_DIR/../auto-paper-md-converter-skill"}
+if [[ "$AUTO_PUBLISH_AFTER_SYNC" == "0" || "$AUTO_PUBLISH_AFTER_SYNC" == "false" || "$AUTO_PUBLISH_AFTER_SYNC" == "False" ]]; then
+  echo "[$(date '+%F %T')] 跳过共享静态发布(AUTO_PUBLISH_AFTER_SYNC=$AUTO_PUBLISH_AFTER_SYNC)" | tee -a "$LOG_FILE"
+elif [[ ! -d "$PUBLISHER_DIR" ]]; then
+  echo "[$(date '+%F %T')] ⚠️ 未找到共享发布项目:$PUBLISHER_DIR" | tee -a "$LOG_FILE"
+else
+  if [[ -x "$PUBLISHER_DIR/.venv/bin/python" ]]; then
+    PUBLISH_PYTHON="$PUBLISHER_DIR/.venv/bin/python"
+  else
+    PUBLISH_PYTHON=python3
+  fi
+  if (
+    cd "$PUBLISHER_DIR"
+    "$PUBLISH_PYTHON" scripts/publish.py --no-process --no-deploy \
+      --te-output-dir "$PROJECT_DIR/output_results"
+  ) 2>&1 | tee -a "$LOG_FILE"; then
+    echo "[$(date '+%F %T')] ✓ 共享本地静态站点已刷新" | tee -a "$LOG_FILE"
+  else
+    echo "[$(date '+%F %T')] ⚠️ 共享本地静态站点发布失败" | tee -a "$LOG_FILE"
+  fi
+fi
+
 echo "[$(date '+%F %T')] 全部完成,exit code=$RC" | tee -a "$LOG_FILE"
 exit 0
