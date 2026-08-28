@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -54,25 +54,36 @@ PAPER_PUBLICATION_TYPE = "TE"
 PAPER_PUBLICATION_NAME = "The Economist"
 
 
-def validate_issue_date(issue_date: str) -> tuple[bool, str]:
-    """校验 issue 日期合法性 + 是否周六(Economist weekly 仅周六发布,其他日期 SSR 数据是空)。
-
-    返回 (is_valid, error_message)。合法返回 (True, "")。
-    """
+def resolve_issue_date(issue_date: str) -> tuple[str | None, str]:
+    """把周五/周六运行日期解析为 Economist 标注的周六期号。"""
     try:
         d = datetime.strptime(issue_date, "%Y-%m-%d")
     except ValueError:
-        return False, f"日期格式错误:{issue_date!r},期望 YYYY-MM-DD"
+        return None, f"日期格式错误:{issue_date!r},期望 YYYY-MM-DD"
     if d.year < 2010 or d.year > 2100:
-        return False, f"年份超出合理范围:{d.year}"
-    # weekday(): Monday=0 ... Sunday=6; Saturday=5
-    if d.weekday() != 5:
-        weekday_name = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][d.weekday()]
-        return False, (
-            f"{issue_date} 是{weekday_name},不是周六。Economist weekly edition 仅周六发布,"
-            f"其他日期 SSR 数据是空(返回 0 条),建议改成最近的周六。"
-        )
-    return True, ""
+        return None, f"年份超出合理范围:{d.year}"
+
+    # 新一期通常在周五已上线，但 weeklyedition URL 和期刊数据使用次日周六作期号。
+    if d.weekday() == 4:
+        return (d + timedelta(days=1)).strftime("%Y-%m-%d"), ""
+    if d.weekday() == 5:
+        return issue_date, ""
+
+    weekday_name = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][d.weekday()]
+    return None, (
+        f"{issue_date} 是{weekday_name}。Economist weekly edition 仅支持周五或周六抓取；"
+        f"周五会自动使用次日周六的期号。"
+    )
+
+
+def validate_issue_date(issue_date: str) -> tuple[bool, str]:
+    """校验 issue 日期是否合法且为周五或周六。
+
+    返回 (is_valid, error_message)。合法返回 (True, "")。
+    """
+    _, error = resolve_issue_date(issue_date)
+    return not error, error
+
 
 SELECTORS = {
     # 集中化，DOM 改版时只改这里
@@ -148,7 +159,8 @@ DEFAULTS = {
     "glossary": {
         "enabled": True,
         "model": "",
-        "max_terms": 32,
+        # Leave room for targeted repair results after the initial 32 candidates.
+        "max_terms": 48,
         "max_candidates": 32,
         "max_input_chars": 24000,
         "max_tokens": 5000,
@@ -458,6 +470,7 @@ def _normalise_paper_article(article: dict[str, Any], index: int) -> dict[str, A
         "content_raw": str(article.get("content_raw") or article.get("content_markdown") or "").strip(),
         "paragraphs": normalized_paragraphs,
         "images": article.get("images") or [],
+        "image_placements": article.get("image_placements") or [],
         "image_insights": article.get("image_insights") or [],
         "term_annotations": article.get("term_annotations") or [],
         "glossary_analysis_complete": bool(article.get("glossary_analysis_complete")),
@@ -978,17 +991,20 @@ def _cleanup_stale_chrome_locks(profile_path: str | Path) -> int:
 def fetch_weekly_index(page, issue_date: str | None = None, debug_html_dir: Path | None = None) -> list[dict[str, str]]:
     """访问 weeklyedition 目录,返回 [{url, section, title, issue_date}, ...]。
 
-    `issue_date` 非空时:访问 /weeklyedition/<YYYY-MM-DD> 指定期次(必须是周六)。
+    `issue_date` 非空时:访问 /weeklyedition/<YYYY-MM-DD> 指定期次；周五自动映射到次日周六。
     `issue_date` 为空时:访问 /weeklyedition 默认页(最新期)。
 
     优化策略:绕过容易返回 None 的客户端 JS 执行,直接用 Python 正则解析 SSR 源码。
     """
     if issue_date:
-        ok, err = validate_issue_date(issue_date)
-        if not ok:
+        resolved_issue_date, err = resolve_issue_date(issue_date)
+        if not resolved_issue_date:
             log.error(f"[weekly] {err}")
-            log.error("[weekly] 拒绝抓取(日期不是周六)。如要强行试,绕过此检查即可。")
+            log.error("[weekly] 拒绝抓取(仅支持周五或周六日期)。")
             return []
+        if resolved_issue_date != issue_date:
+            log.info(f"[weekly] 周五运行日期 {issue_date} 自动映射为周六期号 {resolved_issue_date}")
+        issue_date = resolved_issue_date
         url = f"{WEEKLY_URL}/{issue_date}"
     else:
         url = WEEKLY_URL
@@ -2118,8 +2134,9 @@ def _covered_candidate_keys(
         (int(item.get("paragraph_index") or 0), str(item.get("surface") or "").casefold())
         for item in annotations
         if isinstance(item, dict)
-        and entry_terms.get(str(item.get("glossary_id") or ""))
-        == str(item.get("surface") or "").casefold()
+        # The annotation surface is the exact text visible in the paragraph. It may
+        # differ from the glossary term by punctuation or an accented character.
+        and str(item.get("glossary_id") or "") in entry_terms
     }
 
 
@@ -2231,23 +2248,29 @@ def enrich_article_glossary(
     raw_terms, succeeded = request_terms(prompt, "关键词解析")
     _apply_glossary_terms(article, raw_terms, complete=False, max_terms=max_terms)
 
-    missing = _missing_glossary_candidates(
-        candidates,
-        article.get("term_annotations") or [],
-        article.get("glossary_entries") or [],
-    )
-    if succeeded and missing:
+    for repair_round in range(2):
+        missing = _missing_glossary_candidates(
+            candidates,
+            article.get("term_annotations") or [],
+            article.get("glossary_entries") or [],
+        )
+        if not succeeded or not missing:
+            break
         repair_limit = min(max_terms, len(missing))
         repair_prompt = _glossary_prompt(
             str(article.get("title") or "Untitled"), paragraphs, repair_limit, missing,
             only_candidates=True,
             max_input_chars=max(2000, int(glossary_cfg.get("max_input_chars", 24000))),
         )
-        repair_terms, repair_succeeded = request_terms(repair_prompt, "关键词漏项补充解析")
+        repair_terms, repair_succeeded = request_terms(
+            repair_prompt, f"关键词漏项补充解析第 {repair_round + 1} 轮"
+        )
         if repair_succeeded:
             extra = {"paragraphs": paragraphs}
             _apply_glossary_terms(extra, repair_terms, complete=False, max_terms=repair_limit)
             _merge_glossary_articles(article, extra, max_terms)
+        else:
+            break
 
     _order_glossary_by_candidates(article, candidates)
     missing = _missing_glossary_candidates(
@@ -2717,6 +2740,15 @@ def process_issue(
     debug_html_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     """抓一个 issue。浏览器串行，正文编译和图片解析由独立 LLM 队列并发完成。"""
+    resolved_issue_date, issue_error = resolve_issue_date(issue_date)
+    if not resolved_issue_date:
+        log.error(f"[weekly] {issue_error}")
+        log.error("[weekly] 拒绝抓取(仅支持周五或周六日期)。")
+        return []
+    if resolved_issue_date != issue_date:
+        log.info(f"[weekly] 周五运行日期 {issue_date} 自动映射为周六期号 {resolved_issue_date}")
+    issue_date = resolved_issue_date
+
     browser_cfg = cfg["browser"]
     delay_min = float(cfg["crawl"].get("delay_min_s", 5))
     delay_max = float(cfg["crawl"].get("delay_max_s", 10))
@@ -3128,7 +3160,11 @@ def import_cookies_to_profile(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="经济学人周报抓取与归档")
     p.add_argument("--dry-run", action="store_true", help="只列链接,不入库不推")
-    p.add_argument("--issue", default=None, help="指定 issue 日期 (YYYY-MM-DD)")
+    p.add_argument(
+        "--issue",
+        default=None,
+        help="指定周五/周六运行日期 (YYYY-MM-DD)，周五自动映射到次日周六期号",
+    )
     p.add_argument("--limit", type=int, default=0, help="限制本次最多新增文章数(0=不限制)")
     p.add_argument("--refresh-images", action="store_true",
                    help="只重新抓取现有文章的正文图片并生成图片解析，不重抓正文")

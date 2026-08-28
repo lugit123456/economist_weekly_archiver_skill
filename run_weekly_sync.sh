@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Economist 周报每周五晚定时抓取 —— launchd 调用入口
 # 用法:
-#   ./run_weekly_sync.sh                  (默认算上一个周六)
+#   ./run_weekly_sync.sh                  (周五取次日周六，其余日期按脚本规则取最近周六)
 #   ./run_weekly_sync.sh --issue 2026-07-11  (显式指定 issue 日期,debug 用)
 #
 # 完整流程:

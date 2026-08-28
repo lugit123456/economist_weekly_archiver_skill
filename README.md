@@ -139,10 +139,10 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 ## 使用
 
 ```bash
-# 抓最新一期
+# 抓最新一期；周五运行会自动使用次日周六的期号
 python sync_weekly.py
 
-# 抓指定周六期；先只新增 3 篇检查结果
+# 抓指定周五/周六期；周五会映射到次日周六，先只新增 3 篇检查结果
 python sync_weekly.py --issue 2026-08-01 --limit 3 --no-feishu
 
 # 全量抓取指定期；已存在 URL 会自动跳过
@@ -172,7 +172,7 @@ python sync_weekly.py --kill-stale
 完整参数：
 
 ```text
---issue DATE              指定期，必须是周六
+--issue DATE              指定运行日期，支持周五/周六；周五映射到次日周六期号
 --limit N                 最多新增 N 篇，0=不限
 --dry-run                 只列候选 URL
 --no-feishu               不推送 Feishu

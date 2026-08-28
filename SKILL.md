@@ -76,7 +76,7 @@ python sync_weekly.py --issue 2026-08-01 --refresh-glossary \
 ## CLI
 
 ```text
---issue YYYY-MM-DD       抓指定周六期；省略则抓最新一期
+--issue YYYY-MM-DD       抓指定周五/周六期；周五自动使用次日周六期号，省略则按当天解析
 --limit N                本次最多新增 N 篇，0 表示不限制
 --dry-run                只列出候选链接，不抓正文、不写库
 --no-feishu              不推送 Feishu
