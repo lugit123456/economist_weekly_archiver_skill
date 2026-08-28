@@ -433,6 +433,7 @@
             title: article.title || 'Untitled',
             title_zh: article.title_zh || '',
             images: Array.isArray(article.images) ? article.images : [],
+            image_placements: Array.isArray(article.image_placements) ? article.image_placements : [],
             image_insights: Array.isArray(article.image_insights) ? article.image_insights : [],
             term_annotations: Array.isArray(article.term_annotations) ? article.term_annotations : [],
             paragraphs: normalizeParagraphs(article, id),
@@ -616,39 +617,60 @@
             return;
         }
 
-        const imageMarkup = renderArticleImages(article, issue);
-        grid.innerHTML = imageMarkup + paragraphs.map((paragraph, index) => {
+        const imageGroups = groupArticleImages(article, paragraphs.length);
+        grid.innerHTML = renderArticleImages(article, issue, imageGroups.get(0) || [])
+            + paragraphs.map((paragraph, index) => {
             const zh = paragraph.zh_text
                 ? renderMarkdown(paragraph.zh_text, issue)
                 : '<span class="text-muted">暂无中文翻译</span>';
             const en = paragraph.en_text
                 ? renderMarkdown(paragraph.en_text, issue)
                 : '';
-            return `
+            const paragraphMarkup = `
                 <div class="bilingual-pair" data-para-id="${escapeHtml(paragraph.para_id || '')}"
                      data-paragraph-index="${index + 1}">
                     <div class="bilingual-pair-en">${en}</div>
                     <div class="bilingual-pair-zh">${zh}</div>
                 </div>
             `;
+            return paragraphMarkup
+                + renderArticleImages(article, issue, imageGroups.get(index + 1) || []);
         }).join('');
         applyGlossaryAnnotations(grid, article, issue);
     }
 
-    function renderArticleImages(article, issue) {
+    function groupArticleImages(article, paragraphCount) {
+        const placementByPath = new Map(
+            (article.image_placements || []).map(item => [String(item.path || ''), item])
+        );
+        const groups = new Map();
+        (article.images || []).forEach((path, index) => {
+            const placement = placementByPath.get(String(path));
+            const rawPosition = placement ? Number(placement.after_paragraph) : 0;
+            const afterParagraph = Number.isFinite(rawPosition)
+                ? Math.min(Math.max(Math.trunc(rawPosition), 0), paragraphCount)
+                : 0;
+            if (!groups.has(afterParagraph)) groups.set(afterParagraph, []);
+            groups.get(afterParagraph).push({ path, index });
+        });
+        return groups;
+    }
+
+    function renderArticleImages(article, issue, positionedImages) {
         const insights = article.image_insights || [];
         const insightByPath = new Map(insights.map(item => [String(item.path || ''), item]));
-        const images = (article.images || []).map(path => ({
-            path: resolveIssueAsset(issue, path),
-            rawPath: path,
-            insight: insightByPath.get(String(path)) || null,
+        const images = positionedImages.map(image => ({
+            path: resolveIssueAsset(issue, image.path),
+            rawPath: image.path,
+            index: image.index,
+            insight: insightByPath.get(String(image.path)) || null,
         }));
         if (!images.length) return '';
-        return `<div class="article-image-analysis"><div class="article-image-analysis-title">图片与图表</div><div class="article-image-grid">${images.map((image, index) => {
+        return `<div class="article-image-analysis"><div class="article-image-grid">${images.map(image => {
             const insight = image.insight || {};
             const caption = insight.description || article.title || '';
-            const kind = insight.image_type === 'chart' ? '📊 图表' : '图片';
-            return `<figure class="article-image-item" data-image-index="${index}"><img src="${escapeHtml(image.path)}" alt="${escapeHtml(caption)}" loading="lazy"><figcaption><span class="article-image-kind">${kind}</span>${escapeHtml(caption)}</figcaption></figure>`;
+            const kind = insight.image_type === 'chart' ? '图表' : '图片';
+            return `<figure class="article-image-item" data-image-index="${image.index}"><img src="${escapeHtml(image.path)}" alt="${escapeHtml(caption)}" loading="lazy"><figcaption><span class="article-image-kind">${kind}</span>${escapeHtml(caption)}</figcaption></figure>`;
         }).join('')}</div></div>`;
     }
 

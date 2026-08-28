@@ -1163,6 +1163,60 @@ def _collect_article_image_urls(value: Any, output: list[str], seen: set[str]) -
             _collect_article_image_urls(item, output, seen)
 
 
+def _parse_next_article_content(
+    content_data: dict[str, Any],
+) -> tuple[str, str, list[str], list[dict[str, Any]]]:
+    """Parse text and retain each image's position in the article body."""
+    title = str(content_data.get("headline") or "").strip()
+    body_components = content_data.get("body", [])
+    if not isinstance(body_components, list):
+        body_components = []
+
+    image_urls: list[str] = []
+    image_placements: list[dict[str, Any]] = []
+    seen_image_urls: set[str] = set()
+
+    def collect_images(value: Any, after_paragraph: int) -> None:
+        found: list[str] = []
+        _collect_article_image_urls(value, found, seen_image_urls)
+        for image_url in found:
+            image_urls.append(image_url)
+            image_placements.append({
+                "url": image_url,
+                "after_paragraph": after_paragraph,
+            })
+
+    # Lead media belongs before the first paragraph. Restrict this scan to
+    # known fields so recommendations and weekly-edition covers stay excluded.
+    for key in (
+        "image", "imageUrl", "image_url", "leadImage", "lead_image",
+        "leadMedia", "leadComponent", "media", "imageData", "teaserImage",
+    ):
+        collect_images(content_data.get(key), 0)
+
+    paragraphs: list[str] = []
+    paragraph_index = 0
+    for node in body_components:
+        if not isinstance(node, dict):
+            continue
+        node_type = str(node.get("type") or "").upper()
+        if node_type == "PARAGRAPH":
+            text = str(node.get("text") or "").strip()
+            if text:
+                paragraphs.append(text)
+                paragraph_index += 1
+            continue
+        if node_type == "CROSSHEAD":
+            text = str(node.get("text") or "").strip()
+            if text:
+                paragraphs.append(f"\n## {text}\n")
+                paragraph_index += 1
+            continue
+        collect_images(node, paragraph_index)
+
+    return title, "\n\n".join(paragraphs), image_urls, image_placements
+
+
 def _visible_article_image_urls(page) -> list[str]:
     """只抓 Explore more 之前已渲染的正文和漫画图片。"""
     try:
@@ -1247,8 +1301,8 @@ def _parse_interactive_article_html(html_source: str) -> tuple[str, str, list[st
     return title, "\n\n".join(blocks), image_urls
 
 
-def fetch_article_content(page, url: str) -> tuple[str, str, list[str]]:
-    """访问单篇文章，返回 (title, content_raw, image_urls)。
+def fetch_article_content(page, url: str) -> tuple[str, str, list[str], list[dict[str, Any]]]:
+    """访问单篇文章，返回标题、正文、图片 URL 和正文位置。
 
     【核心修正版】：放弃不稳定的动态 DOM 抓取，全面转向提取并解析页面底部的 __NEXT_DATA__ JSON 块。
     100% 免疫前端改名、懒加载截断和动态闪烁，确保长文章全文无损恢复。
@@ -1262,6 +1316,7 @@ def fetch_article_content(page, url: str) -> tuple[str, str, list[str]]:
     title = ""
     body_text = ""
     image_urls: list[str] = []
+    image_placements: list[dict[str, Any]] = []
     seen_image_urls: set[str] = set()
 
     try:
@@ -1276,37 +1331,14 @@ def fetch_article_content(page, url: str) -> tuple[str, str, list[str]]:
             # 2. 定位到文章的内容核心(props -> pageProps -> content)[cite: 6]
             content_data = raw_json.get("props", {}).get("pageProps", {}).get("content", {})
 
-            # 3. 提取文章的标准 Headline[cite: 6]
-            title = content_data.get("headline", "").strip()
+            parsed = _parse_next_article_content(content_data)
+            title, body_text, image_urls, image_placements = parsed
+            seen_image_urls.update(image_urls)
 
-            # 4. 精准提取完整的正文数组（躺在 JSON 里的 body 节点中）[cite: 6]
-            body_components = content_data.get("body", [])
-            # 正文图通常在 body 中；部分漫画和导语图只出现在文章根节点的 lead image。
-            # 只读这些明确字段，不能再递归扫描整个 content，否则会混入 Explore more 的周刊封面。
-            for key in (
-                "image", "imageUrl", "image_url", "leadImage", "lead_image",
-                "leadMedia", "leadComponent", "media", "imageData",
-            ):
-                _collect_article_image_urls(content_data.get(key), image_urls, seen_image_urls)
-            _collect_article_image_urls(body_components, image_urls, seen_image_urls)
-            paragraphs = []
-
-            for node in body_components:
-                # 如果是标准英文段落，一字不落地提取纯文本[cite: 6]
-                if node.get("type") == "PARAGRAPH":
-                    text = node.get("text", "").strip()
-                    if text:
-                        paragraphs.append(text)
-                # 如果是文章内部的排版小标题(CROSSHEAD)，带上 Markdown 格式保留[cite: 6]
-                elif node.get("type") == "CROSSHEAD":
-                    text = node.get("text", "").strip()
-                    if text:
-                        paragraphs.append(f"\n## {text}\n")
-
-            if paragraphs:
-                body_text = "\n\n".join(paragraphs)
+            if body_text:
                 log.info(
-                    f"[single-url] 成功通过 __NEXT_DATA__ 通道提取全文，共 {len(paragraphs)} 个正文/标题节点[cite: 6]。")
+                    "[single-url] 成功通过 __NEXT_DATA__ 通道提取全文，共 "
+                    f"{len(body_text.split(chr(10) + chr(10)))} 个正文/标题节点[cite: 6]。")
 
     except Exception as e:
         log.error(f"[single-url] 通过 JSON 核心提取正文失败，正在切换至常规 DOM 兜底保底: {e}")
@@ -1354,7 +1386,7 @@ def fetch_article_content(page, url: str) -> tuple[str, str, list[str]]:
         if image_url not in seen_image_urls:
             seen_image_urls.add(image_url)
             image_urls.append(image_url)
-    return title, body_text, image_urls
+    return title, body_text, image_urls, image_placements
 
 
 def _image_extension(url: str, content_type: str) -> str:
@@ -1402,6 +1434,29 @@ def materialize_article_images(
             log.warning(f"图片下载失败，保留远程 URL: {image_url[:100]} ({exc})")
             paths.append(image_url)
     return paths
+
+
+def materialize_image_placements(
+    image_urls: list[str],
+    images: list[str],
+    placements: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Replace source URLs in placement metadata with downloaded image paths."""
+    path_by_url = dict(zip(image_urls[:20], images))
+    result: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for placement in placements:
+        source_url = str(placement.get("url") or "")
+        path = path_by_url.get(source_url)
+        if not path or path in seen_paths:
+            continue
+        try:
+            after_paragraph = max(0, int(placement.get("after_paragraph") or 0))
+        except (TypeError, ValueError):
+            after_paragraph = 0
+        seen_paths.add(path)
+        result.append({"path": path, "after_paragraph": after_paragraph})
+    return result
 
 
 def materialize_issue_cover(cover_url: str, cfg: dict[str, Any], issue_date: str) -> str:
@@ -2467,6 +2522,7 @@ def compile_article_record(
     article_id: str,
     log_: logging.Logger,
     images: list[str] | None = None,
+    image_placements: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """把抓到的正文编译成 Economist 前端需要的结构化 article。"""
     source_paragraphs = _split_article_paragraphs(body)
@@ -2485,6 +2541,7 @@ def compile_article_record(
             "content_markdown": "",
             "paragraphs": [],
             "images": images,
+            "image_placements": image_placements or [],
             "image_insights": [],
             "glossary_entries": [],
             "term_annotations": [],
@@ -2549,6 +2606,7 @@ def compile_article_record(
         "content_markdown": _format_source_content_markdown(source_paragraphs),
         "paragraphs": compiled_paragraphs,
         "images": images or [],
+        "image_placements": image_placements or [],
         "image_insights": [],
         "compiled_article": compile_complete,
         "compile_status": "complete" if compile_complete else "fallback",
@@ -2640,6 +2698,7 @@ def _compile_article_task(cfg: dict[str, Any], payload: dict[str, Any]) -> dict[
         article_id=payload["article_id"],
         log_=log,
         images=payload["images"],
+        image_placements=payload.get("image_placements") or [],
     )
 
 
@@ -2787,7 +2846,7 @@ def process_issue(
                     continue
                 log.info(f"抓取正文: {cand['title'][:60]}")
                 try:
-                    title, body, image_urls = fetch_article_content(page, url)
+                    title, body, image_urls, source_image_placements = fetch_article_content(page, url)
                 except Exception as exc:
                     log.warning(f"抓取失败 {url}: {exc}")
                     time.sleep(random.uniform(delay_min, delay_max))
@@ -2800,6 +2859,7 @@ def process_issue(
                 title = title or cand["title"]
                 article_id = f"art_{issue_date}_{seq:03d}"
                 seq += 1
+                images = materialize_article_images(image_urls, cfg, issue_date, article_id)
                 payload = {
                     "issue_date": issue_date,
                     "section": cand["section"],
@@ -2807,7 +2867,10 @@ def process_issue(
                     "url": url,
                     "body": body,
                     "article_id": article_id,
-                    "images": materialize_article_images(image_urls, cfg, issue_date, article_id),
+                    "images": images,
+                    "image_placements": materialize_image_placements(
+                        image_urls, images, source_image_placements
+                    ),
                 }
                 pending_compile[compile_pool.submit(_compile_article_task, cfg, payload)] = payload
                 time.sleep(random.uniform(delay_min, delay_max))
@@ -2858,9 +2921,12 @@ def refresh_article_images(
         for article in targets:
             url = str(article.get("url") or "")
             try:
-                _, _, image_urls = fetch_article_content(page, url)
+                _, _, image_urls, source_image_placements = fetch_article_content(page, url)
                 article["images"] = materialize_article_images(
                     image_urls, cfg, issue_date, str(article.get("id") or "article")
+                )
+                article["image_placements"] = materialize_image_placements(
+                    image_urls, article["images"], source_image_placements
                 )
                 article["image_insights"] = analyze_article_images(
                     client, cfg, issue_date, str(article.get("title") or ""), article["images"], log
@@ -3145,7 +3211,7 @@ def process_single_url(
     page = open_browser(browser_cfg["user_data_path"], bool(browser_cfg.get("headless", False)))
     try:
         log.info(f"[single-url] 抓取: {url}")
-        title, body, image_urls = fetch_article_content(page, url)
+        title, body, image_urls, source_image_placements = fetch_article_content(page, url)
         if not body.strip() and not image_urls:
             log.warning(f"未提取到正文或图片，丢弃: {url}")
             return []
@@ -3156,6 +3222,9 @@ def process_single_url(
             url, title, body, "", section=section,
         )
         images = materialize_article_images(image_urls, cfg, article["issue_date"], article["id"])
+        image_placements = materialize_image_placements(
+            image_urls, images, source_image_placements
+        )
         compiled = compile_article_record(
             client,
             cfg,
@@ -3167,6 +3236,7 @@ def process_single_url(
             article_id=article["id"],
             log_=log,
             images=images,
+            image_placements=image_placements,
         )
         if not compiled:
             log.warning(f"[single-url] 结构化编译失败,丢弃: {url}")
