@@ -12,6 +12,7 @@ from sync_weekly import (
     _summary_length_bounds,
     compile_article_record,
     materialize_image_placements,
+    image_insight_placeholders,
 )
 
 
@@ -47,6 +48,16 @@ def _client(payloads: list[dict[str, object]]) -> tuple[SimpleNamespace, _FakeCo
 
 
 class ArticleCompileTests(unittest.TestCase):
+    def test_image_insights_use_blank_caption_placeholders(self) -> None:
+        images = ["images/lead.jpg", "images/chart.png"]
+        self.assertEqual(
+            image_insight_placeholders(images),
+            [
+                {"path": "images/lead.jpg", "image_type": "image", "description": " "},
+                {"path": "images/chart.png", "image_type": "image", "description": " "},
+            ],
+        )
+
     def test_translation_and_summary_use_separate_requests(self) -> None:
         summary = _natural_summary()
         client, completions = _client([

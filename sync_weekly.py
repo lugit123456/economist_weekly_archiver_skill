@@ -167,7 +167,7 @@ DEFAULTS = {
         "max_retries": 2,
     },
     "image_analysis": {
-        "enabled": True,
+        "enabled": False,
         "model": "",
         "max_tokens": 2400,
         "max_retries": 2,
@@ -309,10 +309,6 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
     raw_glossary_enabled = src.get("LLM_GLOSSARY_ENABLED", "").strip().lower()
     if raw_glossary_enabled:
         cfg["glossary"]["enabled"] = raw_glossary_enabled in ("1", "true", "yes", "on")
-    raw_image_analysis_enabled = src.get("LLM_ANALYZE_ARTICLE_IMAGES", "").strip().lower()
-    if raw_image_analysis_enabled:
-        cfg["image_analysis"]["enabled"] = raw_image_analysis_enabled in ("1", "true", "yes", "on")
-
     paths = cfg.get("paths") or {}
     if not str(paths.get("output_root") or "").strip():
         paths["output_root"] = str(ROOT / "output_results")
@@ -1498,6 +1494,14 @@ def materialize_issue_cover(cover_url: str, cfg: dict[str, Any], issue_date: str
         return ""
 
 
+def image_insight_placeholders(images: list[str]) -> list[dict[str, Any]]:
+    """Suppress caption fallback while intentionally omitting image analysis."""
+    return [
+        {"path": path, "image_type": "image", "description": " "}
+        for path in images
+    ]
+
+
 def analyze_article_images(
     client: Any,
     cfg: dict[str, Any],
@@ -1506,101 +1510,8 @@ def analyze_article_images(
     images: list[str],
     log_: logging.Logger,
 ) -> list[dict[str, Any]]:
-    """用 .env LLM 对正文图片/图表做 50-80 字中文简析。"""
-    settings = cfg["image_analysis"]
-    if not settings.get("enabled") or not images:
-        return []
-    output_root = _paper_output_root(cfg)
-    content: list[dict[str, Any]] = [{
-        "type": "text",
-        "text": (
-            "请逐张分析下面文章中的图片或图表。每张只写一段 50-80 个中文字符的简短说明，"
-            "说明画面/图表展示的内容及其与文章的关系；不要编造图片中看不出的数字或事实。"
-            "返回严格 JSON，不要 Markdown。格式："
-            '{"images":[{"index":1,"image_type":"photo|chart|cartoon|illustration",'
-            '"description":"50-80字中文简析"}]}\n文章标题：' + title
-        ),
-    }]
-    usable_images = images[: max(1, int(settings["max_images"]))]
-    for image_path in usable_images:
-        if image_path.startswith("images/"):
-            local_path = output_root / PAPER_PUBLICATION_TYPE / issue_date / image_path
-            try:
-                import base64
-                import mimetypes
-                mime = mimetypes.guess_type(local_path.name)[0] or "image/jpeg"
-                data = base64.b64encode(local_path.read_bytes()).decode("ascii")
-                image_url = f"data:{mime};base64,{data}"
-            except Exception as exc:
-                log_.warning(f"读取本地图片失败，跳过解析 {image_path}: {exc}")
-                continue
-        elif _is_article_image_url(image_path):
-            image_url = image_path
-        else:
-            continue
-        content.append({"type": "image_url", "image_url": {"url": image_url, "detail": "low"}})
-
-    if len(content) == 1:
-        return []
-    model = settings.get("model") or cfg["llm"].get("model", "gpt-4o-mini")
-    for attempt in range(int(settings["max_retries"]) + 1):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "你是严谨的图片与数据图表编辑，只返回 JSON。"},
-                    {"role": "user", "content": content},
-                ],
-                max_tokens=int(settings["max_tokens"]),
-                temperature=0.2,
-                response_format={"type": "json_object"},
-            )
-            raw = _extract_json_payload(response.choices[0].message.content or "")
-            raw_items = (
-                raw.get("images")
-                or raw.get("image_insights")
-                or raw.get("analyses")
-                or raw.get("items")
-                or []
-            )
-            if not isinstance(raw_items, list):
-                raise ValueError("图片解析结果不是 images 数组")
-            insights: list[dict[str, Any]] = []
-            for item in raw_items:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    index = int(item.get("index") or item.get("image_index") or item.get("image_number") or 0)
-                except (TypeError, ValueError):
-                    continue
-                if index == 0 and len(usable_images) == 1:
-                    index = 1
-                description = str(
-                    item.get("description") or item.get("analysis") or item.get("caption") or ""
-                ).strip()
-                if 35 <= count_cn_chars(description) < 50:
-                    description += "，帮助读者把握文章所讨论的背景与变化。"
-                if not (1 <= index <= len(usable_images)) or not (50 <= count_cn_chars(description) <= 80):
-                    continue
-                image_type = str(item.get("image_type") or "illustration").strip().lower()
-                if image_type not in {"photo", "chart", "cartoon", "illustration"}:
-                    image_type = "illustration"
-                insights.append({
-                    "path": usable_images[index - 1],
-                    "image_type": image_type,
-                    "description": description,
-                })
-            if insights:
-                return insights
-            raise ValueError(
-                "图片解析结果没有合格的 50-80 字说明: "
-                + json.dumps(raw, ensure_ascii=False)[:500]
-            )
-        except Exception as exc:
-            log_.warning(f"图片解析失败 (attempt {attempt + 1}): {exc}")
-            if not _should_retry_llm_error(exc, attempt, int(settings["max_retries"])):
-                break
-    return []
+    """Compatibility wrapper: image analysis is retired in favour of blank captions."""
+    return image_insight_placeholders(images)
 
 
 def _parse_article_html(html: str) -> tuple[str, str]:
@@ -2565,7 +2476,7 @@ def compile_article_record(
             "paragraphs": [],
             "images": images,
             "image_placements": image_placements or [],
-            "image_insights": [],
+            "image_insights": image_insight_placeholders(images),
             "glossary_entries": [],
             "term_annotations": [],
             "glossary_analysis_complete": False,
@@ -2630,7 +2541,7 @@ def compile_article_record(
         "paragraphs": compiled_paragraphs,
         "images": images or [],
         "image_placements": image_placements or [],
-        "image_insights": [],
+        "image_insights": image_insight_placeholders(images or []),
         "compiled_article": compile_complete,
         "compile_status": "complete" if compile_complete else "fallback",
     }
@@ -2739,7 +2650,7 @@ def process_issue(
     no_feishu: bool = False,
     debug_html_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """抓一个 issue。浏览器串行，正文编译和图片解析由独立 LLM 队列并发完成。"""
+    """抓一个 issue。浏览器串行，正文编译由 LLM 队列并发完成。"""
     resolved_issue_date, issue_error = resolve_issue_date(issue_date)
     if not resolved_issue_date:
         log.error(f"[weekly] {issue_error}")
@@ -2935,7 +2846,7 @@ def process_issue(
 def refresh_article_images(
     cfg: dict[str, Any], issue_date: str, article_ids: set[str], no_feishu: bool = True,
 ) -> list[dict[str, Any]]:
-    """只刷新指定文章的正文图片和图片解析，不重新抓取或翻译正文。"""
+    """只刷新指定文章的正文图片和位置，不重新抓取或翻译正文。"""
     existing = read_database_js()
     targets = [
         article for article in existing
@@ -2947,7 +2858,6 @@ def refresh_article_images(
         return []
 
     page = open_browser(cfg["browser"]["user_data_path"], bool(cfg["browser"].get("headless", False)))
-    client = make_llm_client(cfg)
     refreshed: list[dict[str, Any]] = []
     try:
         for article in targets:
@@ -2960,13 +2870,11 @@ def refresh_article_images(
                 article["image_placements"] = materialize_image_placements(
                     image_urls, article["images"], source_image_placements
                 )
-                article["image_insights"] = analyze_article_images(
-                    client, cfg, issue_date, str(article.get("title") or ""), article["images"], log
-                )
+                article["image_insights"] = image_insight_placeholders(article["images"])
                 refreshed.append(article)
                 log.info(
                     f"[images] 已刷新 {article.get('id')}: "
-                    f"{len(article['images'])} 张图片, {len(article['image_insights'])} 条解析"
+                    f"{len(article['images'])} 张图片, 已写入空白说明占位"
                 )
             except Exception as exc:
                 log.warning(f"[images] 刷新失败 {url}: {exc}")
@@ -3167,7 +3075,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--limit", type=int, default=0, help="限制本次最多新增文章数(0=不限制)")
     p.add_argument("--refresh-images", action="store_true",
-                   help="只重新抓取现有文章的正文图片并生成图片解析，不重抓正文")
+                   help="只重新抓取现有文章的正文图片和位置，不重抓正文")
     p.add_argument("--refresh-glossary", action="store_true",
                    help="只按当前规则重新解析现有文章的中文关键词，不重抓或重译正文")
     p.add_argument("--article-ids", default="",

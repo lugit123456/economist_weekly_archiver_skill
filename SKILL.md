@@ -2,7 +2,7 @@
 name: economist-weekly-archiver
 description: |
   抓取《经济学人》weekly edition 当前或指定期的全部文章，使用 .env 中配置的
-  OpenAI-compatible LLM 生成中文解读、段落翻译、关键词解析和图片简析，下载正文图片，
+  OpenAI-compatible LLM 生成中文解读、段落翻译和关键词解析，下载正文图片，
   持久化到 database.js，并可选推送到 Feishu。支持 --limit 做小批量预览。
 
   触发场景：用户想抓取《经济学人》某一期、补抓单篇文章、刷新已有文章图片或关键词，
@@ -36,7 +36,7 @@ python sync_weekly.py --issue 2026-08-01 --limit 3 --no-feishu
 # 需要时再抓本期剩余文章
 python sync_weekly.py --issue 2026-08-01 --no-feishu
 
-# 重新抓取已有文章图片并生成图片简析
+# 重新抓取已有文章图片和段落位置
 python sync_weekly.py --issue 2026-08-01 --refresh-images \
   --article-ids art_2026-08-01_007,art_2026-08-01_008 --no-feishu
 
@@ -58,12 +58,11 @@ python sync_weekly.py --issue 2026-08-01 --refresh-glossary \
 
 图片只取文章主体和明确的 `leadComponent`/`leadImage` 等字段，并限制在页面
 `Explore more` 之前；`weeklyEdition.cover`、`squareCover` 等周刊封面不会作为正文图片保存。
-每张图片可生成 50-80 个中文字符的 `image_insights`，说明图片、图表或漫画内容及其与文章的关系。
+`image_insights` 为每张图片写入单个空格的说明占位，避免前端回退显示文章标题；不调用模型解析图片。
 
-浏览器访问始终串行；默认使用 2 个正文 LLM worker 和 1 个图片 LLM worker。每篇文章分别请求
-段落翻译和中文解读，再独立解析关键词；关键词解析会提取中文栏英文候选并对漏项补充请求。
-图片解析完成后异步回填，不阻塞文章落库。可通过
-`LLM_COMPILE_WORKERS`、`LLM_IMAGE_WORKERS` 和 `LLM_MAX_PENDING` 调整并发。
+浏览器访问始终串行；默认使用 2 个正文 LLM worker。每篇文章分别请求段落翻译和中文解读，
+再独立解析关键词；关键词解析会提取中文栏英文候选并对漏项补充请求。可通过
+`LLM_COMPILE_WORKERS` 和 `LLM_MAX_PENDING` 调整并发。
 
 每篇文章还可以产生：
 
@@ -80,7 +79,7 @@ python sync_weekly.py --issue 2026-08-01 --refresh-glossary \
 --limit N                本次最多新增 N 篇，0 表示不限制
 --dry-run                只列出候选链接，不抓正文、不写库
 --no-feishu              不推送 Feishu
---refresh-images         只刷新已有文章图片和图片简析
+--refresh-images         只刷新已有文章图片和段落位置
 --refresh-glossary       只重新解析已有中文译文的关键词
 --article-ids IDS        配合刷新命令，逗号分隔 article id
 --single-url URL         只抓指定 URL 一篇
@@ -94,7 +93,7 @@ python sync_weekly.py --issue 2026-08-01 --refresh-glossary \
 
 ## LLM 配置
 
-所有 LLM 调用都读取 `.env` 的配置，不使用 Codex 模型。默认的文章解读、关键词解析和图片解析
+所有 LLM 调用都读取 `.env` 的配置，不使用 Codex 模型。文章解读和关键词解析
 共用 `LLM_API_KEY` 与 `LLM_BASE_URL`；各功能可单独指定模型：
 
 ```dotenv
@@ -103,8 +102,6 @@ LLM_BASE_URL=https://api.example.com/v1
 LLM_MODEL=gpt-4o-mini
 LLM_GLOSSARY_ENABLED=true
 LLM_GLOSSARY_MODEL=
-OPENAI_VISION_MODEL=
-LLM_ANALYZE_ARTICLE_IMAGES=true
 ```
 
 完整配置项和默认值见 `.env.example` 与 `README.md`。
