@@ -71,12 +71,12 @@ python sync_weekly.py --import-cookies ~/Downloads/economist_cookies.json
 |---|---|---|
 | `LLM_API_KEY` | LLM API key | 空，必须填写 |
 | `LLM_BASE_URL` | OpenAI-compatible API 地址 | 官方 API |
-| `LLM_MODEL` | 文章中文解读和逐段翻译模型 | `gpt-4o-mini` |
+| `LLM_MODEL` | 文章中文解读和逐段翻译模型 | `gpt-5.6-luna` |
 | `LLM_MAX_TOKENS` | 文章请求最大 token 数 | `2048` |
 | `LLM_TEMPERATURE` | 文章请求 temperature | `0.4` |
 | `LLM_TIMEOUT_S` | LLM 请求超时秒数 | `60` |
 | `CRAWL_DELAY_MIN_S` / `CRAWL_DELAY_MAX_S` | 抓取间隔范围 | `5` / `10` |
-| `CRAWL_MAX_RETRIES` | 抓取相关 LLM 重试次数 | `2` |
+| `CRAWL_MAX_RETRIES` | 抓取相关 LLM 重试次数 | `1` |
 
 ### 关键词解析
 

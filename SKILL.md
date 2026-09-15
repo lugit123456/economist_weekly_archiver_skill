@@ -99,7 +99,7 @@ python sync_weekly.py --issue 2026-08-01 --refresh-glossary \
 ```dotenv
 LLM_API_KEY=sk-...
 LLM_BASE_URL=https://api.example.com/v1
-LLM_MODEL=gpt-4o-mini
+LLM_MODEL=gpt-5.6-luna
 LLM_GLOSSARY_ENABLED=true
 LLM_GLOSSARY_MODEL=
 ```
